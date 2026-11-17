@@ -1,4 +1,4 @@
-// GitHub REST v3 server implementation for github-core-clone-01.
+// GitHub REST v3, GraphQL v4 and git smart HTTP server for github-core-clone-01.
 // stdlib only (node:http, node:crypto), TypeScript that Node 22 strips.
 
 import { createHash, randomUUID } from 'node:crypto';
@@ -580,6 +580,7 @@ function collectReachable(
   roots: Iterable<string>,
   lookup: (oid: string) => { type: GitObjectType; data: Buffer } | undefined,
   seen: Set<string> = new Set<string>(),
+  shallow: ReadonlySet<string> = new Set<string>(),
 ): Set<string> {
   const queue: string[] = [];
   for (const root of roots) if (root && root !== ZERO_OID) queue.push(root);
@@ -592,7 +593,9 @@ function collectReachable(
     if (object.type === 'commit') {
       const commit = parseCommit(object.data);
       queue.push(commit.tree);
-      for (const parent of commit.parents) queue.push(parent);
+      if (!shallow.has(oid)) {
+        for (const parent of commit.parents) queue.push(parent);
+      }
     } else if (object.type === 'tag') {
       queue.push(parseTag(object.data).object);
     } else if (object.type === 'tree') {
@@ -1074,6 +1077,753 @@ function pullJson(pull: PullRequest, repo: Repository): Record<string, unknown> 
   return res;
 }
 
+// Shared writes for REST and GraphQL: both surfaces operate on the same records and git objects.
+function createIssueRecord(repo: Repository, viewer: User, title: string, body: string, labels: string[] = []): Issue {
+  const now = new Date().toISOString();
+  const issue: Issue = {
+    number: ++repo.issueCounter,
+    title,
+    body,
+    state: 'open',
+    labels,
+    comments: 0,
+    created_at: now,
+    updated_at: now,
+    user: { login: viewer.login, id: viewer.id },
+  };
+  repo.issues.set(issue.number, issue);
+  return issue;
+}
+
+function createCommentRecord(repo: Repository, viewer: User, subject: Issue | PullRequest, body: string): Comment {
+  const now = new Date().toISOString();
+  const comment: Comment = {
+    id: store.nextCommentId++,
+    body,
+    issue_number: subject.number,
+    created_at: now,
+    updated_at: now,
+    user: { login: viewer.login, id: viewer.id },
+  };
+  repo.comments.set(comment.id, comment);
+  if ('comments' in subject) subject.comments++;
+  subject.updated_at = now;
+  return comment;
+}
+
+function createPullRecord(repo: Repository, viewer: User, title: string, body: string, head: string, base: string): PullRequest | null {
+  const headSha = repo.branches.get(head) || repo.refs.get(head);
+  const baseSha = repo.branches.get(base) || repo.refs.get(base);
+  if (!headSha || !baseSha) return null;
+  const now = new Date().toISOString();
+  const pull: PullRequest = {
+    number: ++repo.pullCounter,
+    title,
+    body,
+    state: 'open',
+    head: { ref: head, sha: headSha },
+    base: { ref: base, sha: baseSha },
+    merged: false,
+    mergeable: true,
+    created_at: now,
+    updated_at: now,
+    user: { login: viewer.login, id: viewer.id },
+  };
+  repo.pulls.set(pull.number, pull);
+  return pull;
+}
+
+function mergePullRecord(
+  repo: Repository,
+  pull: PullRequest,
+  viewer: User,
+  commitTitle?: string,
+  mergeMethod: string = 'SQUASH',
+): GitCommit | null {
+  const currentBaseSha = repo.branches.get(pull.base.ref) || pull.base.sha;
+  const currentHeadSha = repo.branches.get(pull.head.ref) || pull.head.sha;
+  const ancestorSha = store.findCommonAncestor(currentBaseSha, currentHeadSha) || pull.base.sha;
+  const ancestorFiles = store.getFilesAtCommit(ancestorSha);
+  const baseFiles = store.getFilesAtCommit(currentBaseSha);
+  const headFiles = store.getFilesAtCommit(currentHeadSha);
+
+  const allPaths = new Set([...ancestorFiles.keys(), ...baseFiles.keys(), ...headFiles.keys()]);
+  for (const path of allPaths) {
+    const ancestor = ancestorFiles.get(path)?.sha;
+    const base = baseFiles.get(path)?.sha;
+    const head = headFiles.get(path)?.sha;
+    if (base !== ancestor && head !== ancestor && base !== head) return null;
+  }
+
+  const mergedFiles = new Map<string, { sha: string; mode: string }>(baseFiles);
+  for (const [path, entry] of headFiles) mergedFiles.set(path, entry);
+  for (const [path] of ancestorFiles) {
+    if (!headFiles.has(path) && baseFiles.get(path)?.sha === ancestorFiles.get(path)?.sha) {
+      mergedFiles.delete(path);
+    }
+  }
+
+  const newTreeSha = store.buildTreeFromFiles(mergedFiles);
+  const mergeCommit = store.saveCommit(
+    newTreeSha,
+    mergeMethod === 'MERGE' ? [currentBaseSha, currentHeadSha] : [currentBaseSha],
+    commitTitle || `Merge pull request #${pull.number} from ${pull.head.ref}`,
+    { name: viewer.name, email: viewer.email, date: new Date().toISOString() },
+    { name: viewer.name, email: viewer.email, date: new Date().toISOString() },
+  );
+  repo.branches.set(pull.base.ref, mergeCommit.sha);
+  repo.refs.set(`refs/heads/${pull.base.ref}`, mergeCommit.sha);
+  pull.state = 'closed';
+  pull.merged = true;
+  pull.merged_at = new Date().toISOString();
+  pull.merge_commit_sha = mergeCommit.sha;
+  pull.updated_at = pull.merged_at;
+  return mergeCommit;
+}
+
+// ---------------------------------------------------------------------------------------------
+// GraphQL v4: a small document parser, schema validator and selection-set executor.
+
+type GraphQLInputValue =
+  | { kind: 'literal'; value: unknown }
+  | { kind: 'variable'; name: string }
+  | { kind: 'list'; values: GraphQLInputValue[] }
+  | { kind: 'object'; fields: Record<string, GraphQLInputValue> };
+
+interface GraphQLField {
+  kind: 'field';
+  name: string;
+  alias: string;
+  args: Record<string, GraphQLInputValue>;
+  selections: GraphQLSelection[];
+}
+
+type GraphQLSelection = GraphQLField
+  | { kind: 'fragment'; type: string; selections: GraphQLSelection[] }
+  | { kind: 'spread'; name: string };
+
+interface GraphQLOperation {
+  type: 'query' | 'mutation';
+  name?: string;
+  variables: Array<{ name: string; type: string; defaultValue?: GraphQLInputValue }>;
+  selections: GraphQLSelection[];
+}
+
+interface GraphQLDocument {
+  operations: GraphQLOperation[];
+  fragments: Record<string, { type: string; selections: GraphQLSelection[] }>;
+}
+
+interface GraphQLToken {
+  kind: 'name' | 'string' | 'number' | 'punct' | 'eof';
+  value: string;
+}
+
+function tokenizeGraphQL(query: string): GraphQLToken[] {
+  const tokens: GraphQLToken[] = [];
+  let offset = 0;
+  while (offset < query.length) {
+    const char = query[offset]!;
+    if (/[\s,\uFEFF]/.test(char)) { offset++; continue; }
+    if (char === '#') {
+      while (offset < query.length && query[offset] !== '\n' && query[offset] !== '\r') offset++;
+      continue;
+    }
+    if (query.startsWith('...', offset)) {
+      tokens.push({ kind: 'punct', value: '...' });
+      offset += 3;
+      continue;
+    }
+    if (char === '"') {
+      const start = offset++;
+      let closed = false;
+      while (offset < query.length) {
+        if (query[offset] === '\\') { offset += 2; continue; }
+        if (query[offset++] === '"') { closed = true; break; }
+      }
+      if (!closed) throw new Error('Unterminated GraphQL string');
+      tokens.push({ kind: 'string', value: JSON.parse(query.slice(start, offset)) });
+      continue;
+    }
+    const name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(query.slice(offset));
+    if (name) {
+      tokens.push({ kind: 'name', value: name[0] });
+      offset += name[0].length;
+      continue;
+    }
+    const number = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(query.slice(offset));
+    if (number) {
+      tokens.push({ kind: 'number', value: number[0] });
+      offset += number[0].length;
+      continue;
+    }
+    if ('!$():=[]{}'.includes(char)) {
+      tokens.push({ kind: 'punct', value: char });
+      offset++;
+      continue;
+    }
+    throw new Error(`Unexpected GraphQL character ${JSON.stringify(char)}`);
+  }
+  tokens.push({ kind: 'eof', value: '<EOF>' });
+  return tokens;
+}
+
+class GraphQLParser {
+  private readonly tokens: GraphQLToken[];
+  private offset = 0;
+
+  constructor(query: string) { this.tokens = tokenizeGraphQL(query); }
+
+  private peek(): GraphQLToken { return this.tokens[this.offset]!; }
+
+  private accept(value: string): boolean {
+    const token = this.peek();
+    if ((token.kind === 'punct' || token.kind === 'name') && token.value === value) {
+      this.offset++;
+      return true;
+    }
+    return false;
+  }
+
+  private expect(value: string): void {
+    if (!this.accept(value)) throw new Error(`Expected ${value}, found ${this.peek().value}`);
+  }
+
+  private name(): string {
+    const token = this.peek();
+    if (token.kind !== 'name') throw new Error(`Expected a GraphQL name, found ${token.value}`);
+    this.offset++;
+    return token.value;
+  }
+
+  private type(): string {
+    let type: string;
+    if (this.accept('[')) { type = `[${this.type()}]`; this.expect(']'); }
+    else type = this.name();
+    return this.accept('!') ? `${type}!` : type;
+  }
+
+  private value(): GraphQLInputValue {
+    if (this.accept('$')) return { kind: 'variable', name: this.name() };
+    if (this.accept('[')) {
+      const values: GraphQLInputValue[] = [];
+      while (!this.accept(']')) values.push(this.value());
+      return { kind: 'list', values };
+    }
+    if (this.accept('{')) {
+      const fields: Record<string, GraphQLInputValue> = Object.create(null);
+      while (!this.accept('}')) {
+        const name = this.name();
+        this.expect(':');
+        if (Object.hasOwn(fields, name)) throw new Error(`Duplicate input field ${name}`);
+        fields[name] = this.value();
+      }
+      return { kind: 'object', fields };
+    }
+    const token = this.peek();
+    this.offset++;
+    if (token.kind === 'string') return { kind: 'literal', value: token.value };
+    if (token.kind === 'number') return { kind: 'literal', value: Number(token.value) };
+    if (token.kind === 'name') {
+      const value = token.value === 'null' ? null : token.value === 'true' ? true : token.value === 'false' ? false : token.value;
+      return { kind: 'literal', value };
+    }
+    throw new Error(`Expected a GraphQL value, found ${token.value}`);
+  }
+
+  private selections(): GraphQLSelection[] {
+    this.expect('{');
+    const selections: GraphQLSelection[] = [];
+    while (!this.accept('}')) {
+      if (this.accept('...')) {
+        if (this.accept('on')) selections.push({ kind: 'fragment', type: this.name(), selections: this.selections() });
+        else selections.push({ kind: 'spread', name: this.name() });
+        continue;
+      }
+      const first = this.name();
+      const name = this.accept(':') ? this.name() : first;
+      const args: Record<string, GraphQLInputValue> = Object.create(null);
+      if (this.accept('(')) {
+        while (!this.accept(')')) {
+          const arg = this.name();
+          this.expect(':');
+          if (Object.hasOwn(args, arg)) throw new Error(`Duplicate argument ${arg}`);
+          args[arg] = this.value();
+        }
+      }
+      const children = this.peek().value === '{' ? this.selections() : [];
+      selections.push({ kind: 'field', name, alias: first, args, selections: children });
+    }
+    if (selections.length === 0) throw new Error('A GraphQL selection set cannot be empty');
+    return selections;
+  }
+
+  parse(): GraphQLDocument {
+    const operations: GraphQLOperation[] = [];
+    const fragments: GraphQLDocument['fragments'] = Object.create(null);
+    while (this.peek().kind !== 'eof') {
+      if (this.accept('fragment')) {
+        const name = this.name();
+        this.expect('on');
+        const type = this.name();
+        if (Object.hasOwn(fragments, name)) throw new Error(`Duplicate fragment ${name}`);
+        fragments[name] = { type, selections: this.selections() };
+        continue;
+      }
+      if (this.peek().value === '{') {
+        operations.push({ type: 'query', variables: [], selections: this.selections() });
+        continue;
+      }
+      const type = this.name();
+      if (type !== 'query' && type !== 'mutation') throw new Error(`Unsupported operation ${type}`);
+      const name = this.peek().kind === 'name' ? this.name() : undefined;
+      const variables: GraphQLOperation['variables'] = [];
+      if (this.accept('(')) {
+        while (!this.accept(')')) {
+          this.expect('$');
+          const variableName = this.name();
+          this.expect(':');
+          const variableType = this.type();
+          const defaultValue = this.accept('=') ? this.value() : undefined;
+          if (variables.some((variable) => variable.name === variableName)) throw new Error(`Duplicate variable $${variableName}`);
+          variables.push({ name: variableName, type: variableType, defaultValue });
+        }
+      }
+      if (name && operations.some((operation) => operation.name === name)) throw new Error(`Duplicate operation ${name}`);
+      operations.push({ type, name, variables, selections: this.selections() });
+    }
+    if (operations.length === 0) throw new Error('No GraphQL operation was provided');
+    return { operations, fragments };
+  }
+}
+
+// These tables drive both validation and introspection, so advertised fields are executable.
+const GRAPHQL_FIELDS: Record<string, Record<string, string>> = {
+  Query: { viewer: 'User!', repository: 'Repository', node: 'Node', __type: '__Type' },
+  Mutation: {
+    createIssue: 'CreateIssuePayload', closeIssue: 'CloseIssuePayload', createPullRequest: 'CreatePullRequestPayload',
+    mergePullRequest: 'MergePullRequestPayload', addComment: 'AddCommentPayload',
+  },
+  Repository: {
+    id: 'ID!', databaseId: 'Int!', name: 'String!', nameWithOwner: 'String!', owner: 'User!', defaultBranchRef: 'Ref',
+    viewerPermission: 'RepositoryPermission', hasIssuesEnabled: 'Boolean!', issue: 'Issue', issues: 'IssueConnection!',
+    pullRequests: 'PullRequestConnection!', pullRequest: 'PullRequest',
+  },
+  Issue: { id: 'ID!', number: 'Int!', title: 'String!', state: 'IssueState!', body: 'String!' },
+  IssueConnection: { nodes: '[Issue!]!', pageInfo: 'PageInfo!' },
+  PageInfo: { hasNextPage: 'Boolean!', endCursor: 'String' },
+  PullRequest: {
+    id: 'ID!', number: 'Int!', state: 'PullRequestState!', merged: 'Boolean!', headRefName: 'String!',
+    baseRefName: 'String!', mergeable: 'MergeableState!', files: 'PullRequestChangedFileConnection!',
+  },
+  PullRequestConnection: { nodes: '[PullRequest!]!' },
+  PullRequestChangedFileConnection: { nodes: '[PullRequestChangedFile!]!' },
+  PullRequestChangedFile: { path: 'String!' },
+  User: { login: 'String!' },
+  Ref: { name: 'String!' },
+  Node: { id: 'ID!' },
+  CreateIssuePayload: { issue: 'Issue' },
+  CloseIssuePayload: { issue: 'Issue' },
+  CreatePullRequestPayload: { pullRequest: 'PullRequest' },
+  MergePullRequestPayload: { pullRequest: 'PullRequest' },
+  AddCommentPayload: { commentEdge: 'IssueCommentEdge' },
+  IssueCommentEdge: { node: 'IssueComment' },
+  IssueComment: { id: 'ID!', body: 'String!' },
+  __Type: { name: 'String!', kind: '__TypeKind!', fields: '[__Field!]', enumValues: '[__EnumValue!]' },
+  __Field: { name: 'String!' },
+  __EnumValue: { name: 'String!' },
+};
+
+const GRAPHQL_ARGS: Record<string, Record<string, string>> = {
+  'Query.repository': { owner: 'String!', name: 'String!' },
+  'Query.node': { id: 'ID!' },
+  'Query.__type': { name: 'String!' },
+  'Repository.issue': { number: 'Int!' },
+  'Repository.issues': { first: 'Int', states: '[IssueState!]', orderBy: 'IssueOrder', after: 'String' },
+  'Repository.pullRequests': { first: 'Int' },
+  'Repository.pullRequest': { number: 'Int!' },
+  'PullRequest.files': { first: 'Int' },
+  '__Type.fields': { includeDeprecated: 'Boolean' },
+  '__Type.enumValues': { includeDeprecated: 'Boolean' },
+  'Mutation.createIssue': { input: 'CreateIssueInput!' },
+  'Mutation.closeIssue': { input: 'CloseIssueInput!' },
+  'Mutation.createPullRequest': { input: 'CreatePullRequestInput!' },
+  'Mutation.mergePullRequest': { input: 'MergePullRequestInput!' },
+  'Mutation.addComment': { input: 'AddCommentInput!' },
+};
+
+const GRAPHQL_INPUTS: Record<string, Record<string, string>> = {
+  IssueOrder: { field: 'IssueOrderField!', direction: 'OrderDirection!' },
+  CreateIssueInput: { repositoryId: 'ID!', title: 'String!', body: 'String' },
+  CloseIssueInput: { issueId: 'ID!' },
+  CreatePullRequestInput: { repositoryId: 'ID!', baseRefName: 'String!', headRefName: 'String!', title: 'String!' },
+  MergePullRequestInput: { pullRequestId: 'ID!', mergeMethod: 'PullRequestMergeMethod' },
+  AddCommentInput: { subjectId: 'ID!', body: 'String!' },
+};
+
+const GRAPHQL_ENUMS: Record<string, readonly string[]> = {
+  IssueState: ['OPEN', 'CLOSED'],
+  MergeableState: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'],
+  PullRequestState: ['OPEN', 'CLOSED', 'MERGED'],
+  PullRequestMergeMethod: ['MERGE', 'SQUASH', 'REBASE'],
+  RepositoryPermission: ['ADMIN', 'MAINTAIN', 'WRITE', 'TRIAGE', 'READ'],
+  SearchType: ['ISSUE', 'REPOSITORY', 'USER', 'DISCUSSION'],
+  IssueOrderField: ['CREATED_AT', 'UPDATED_AT', 'COMMENTS'],
+  OrderDirection: ['ASC', 'DESC'],
+  __TypeKind: ['SCALAR', 'OBJECT', 'INTERFACE', 'UNION', 'ENUM', 'INPUT_OBJECT', 'LIST', 'NON_NULL'],
+};
+
+function graphQLTypeKind(name: string): string | null {
+  if (Object.hasOwn(GRAPHQL_ENUMS, name)) return 'ENUM';
+  if (Object.hasOwn(GRAPHQL_INPUTS, name)) return 'INPUT_OBJECT';
+  if (name === 'Node') return 'INTERFACE';
+  if (Object.hasOwn(GRAPHQL_FIELDS, name)) return 'OBJECT';
+  return ['String', 'ID', 'Int', 'Float', 'Boolean'].includes(name) ? 'SCALAR' : null;
+}
+
+function graphQLRecord(value: unknown): value is Record<string, any> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function graphQLInput(value: GraphQLInputValue, variables: Record<string, unknown>): unknown {
+  switch (value.kind) {
+    case 'literal': return value.value;
+    case 'variable':
+      if (!Object.hasOwn(variables, value.name)) throw new Error(`Variable $${value.name} is not defined`);
+      return variables[value.name];
+    case 'list': return value.values.map((entry) => graphQLInput(entry, variables));
+    case 'object': return Object.fromEntries(Object.entries(value.fields).map(([name, entry]) => [name, graphQLInput(entry, variables)]));
+  }
+}
+
+function coerceGraphQLInput(value: unknown, type: string, label: string): any {
+  if (type.endsWith('!')) {
+    if (value === null || value === undefined) throw new Error(`${label} of type ${type} is required`);
+    return coerceGraphQLInput(value, type.slice(0, -1), label);
+  }
+  const namedType = type.replace(/[\[\]!]/g, '');
+  if (!Object.hasOwn(GRAPHQL_INPUTS, namedType) && !Object.hasOwn(GRAPHQL_ENUMS, namedType)
+    && !['String', 'ID', 'Int', 'Float', 'Boolean'].includes(namedType)) {
+    throw new Error(`Unknown GraphQL input type ${namedType}`);
+  }
+  if (value === null || value === undefined) return value;
+  if (type.startsWith('[')) {
+    const entries = Array.isArray(value) ? value : [value];
+    return entries.map((entry, index) => coerceGraphQLInput(entry, type.slice(1, -1), `${label}[${index}]`));
+  }
+  if (Object.hasOwn(GRAPHQL_INPUTS, type)) {
+    if (!graphQLRecord(value)) throw new Error(`${label} must be an input object`);
+    const fields = GRAPHQL_INPUTS[type]!;
+    for (const name of Object.keys(value)) {
+      if (!Object.hasOwn(fields, name)) throw new Error(`Unknown field ${name} on input type ${type}`);
+    }
+    return Object.fromEntries(Object.entries(fields).map(([name, fieldType]) => [name, coerceGraphQLInput(value[name], fieldType, `${label}.${name}`)]));
+  }
+  if (Object.hasOwn(GRAPHQL_ENUMS, type)) {
+    if (typeof value !== 'string' || !GRAPHQL_ENUMS[type]!.includes(value)) throw new Error(`${label} is not a valid ${type}`);
+    return value;
+  }
+  if (type === 'ID' && (typeof value === 'string' || (typeof value === 'number' && Number.isInteger(value)))) return String(value);
+  if (type === 'String' && typeof value === 'string') return value;
+  if (type === 'Boolean' && typeof value === 'boolean') return value;
+  if (type === 'Int' && typeof value === 'number' && Number.isInteger(value) && value >= -2147483648 && value <= 2147483647) return value;
+  if (type === 'Float' && typeof value === 'number' && Number.isFinite(value)) return value;
+  throw new Error(`${label} must be of type ${type}`);
+}
+
+function graphQLArguments(type: string, field: GraphQLField, variables: Record<string, unknown>): Record<string, any> {
+  const schema = GRAPHQL_ARGS[`${type}.${field.name}`] ?? {};
+  for (const name of Object.keys(field.args)) {
+    if (!Object.hasOwn(schema, name)) throw new Error(`Unknown argument ${name} on field ${type}.${field.name}`);
+  }
+  return Object.fromEntries(Object.entries(schema).map(([name, argType]) => {
+    const value = Object.hasOwn(field.args, name) ? graphQLInput(field.args[name]!, variables) : undefined;
+    return [name, coerceGraphQLInput(value, argType, `Argument ${type}.${field.name}(${name}:)`)];
+  }));
+}
+
+function validateGraphQLSelections(
+  type: string,
+  selections: GraphQLSelection[],
+  variables: Record<string, unknown>,
+  fragments: GraphQLDocument['fragments'],
+  stack: string[] = [],
+): void {
+  for (const selection of selections) {
+    if (selection.kind !== 'field') {
+      const fragment = selection.kind === 'fragment' ? selection : fragments[selection.name];
+      if (!fragment) throw new Error(`Unknown fragment ${selection.kind === 'spread' ? selection.name : ''}`);
+      if (!Object.hasOwn(GRAPHQL_FIELDS, fragment.type)) throw new Error(`Unknown fragment type ${fragment.type}`);
+      if (selection.kind === 'spread' && stack.includes(selection.name)) throw new Error(`Fragment cycle at ${selection.name}`);
+      if (type !== fragment.type && type !== 'Node' && fragment.type !== 'Node') throw new Error(`Fragment on ${fragment.type} cannot apply to ${type}`);
+      validateGraphQLSelections(fragment.type, fragment.selections, variables, fragments,
+        selection.kind === 'spread' ? [...stack, selection.name] : stack);
+      continue;
+    }
+    const fields = GRAPHQL_FIELDS[type]!;
+    const fieldType = selection.name === '__typename' ? 'String!' : Object.hasOwn(fields, selection.name) ? fields[selection.name] : undefined;
+    if (!fieldType) throw new Error(`Cannot query field "${selection.name}" on type "${type}"`);
+    graphQLArguments(type, selection, variables);
+    const namedType = fieldType.replace(/[\[\]!]/g, '');
+    if (Object.hasOwn(GRAPHQL_FIELDS, namedType)) {
+      if (selection.selections.length === 0) throw new Error(`Field ${type}.${selection.name} requires a selection set`);
+      validateGraphQLSelections(namedType, selection.selections, variables, fragments, stack);
+    } else if (selection.selections.length > 0) {
+      throw new Error(`Field ${type}.${selection.name} cannot have a selection set`);
+    }
+  }
+}
+
+interface GraphQLObject {
+  type: string;
+  value: any;
+  repo?: Repository;
+}
+
+function graphQLObject(type: string, value: any, repo?: Repository): GraphQLObject | null {
+  return value === null || value === undefined ? null : { type, value, repo };
+}
+
+function graphQLId(type: string, databaseId: number, number?: number): string {
+  return Buffer.from(`${type}:${databaseId}${number === undefined ? '' : `:${number}`}`, 'utf8').toString('base64');
+}
+
+function graphQLNode(id: string): GraphQLObject | null {
+  const decoded = Buffer.from(id, 'base64').toString('utf8');
+  const match = /^(Repository|Issue|PullRequest|IssueComment|User):(\d+)(?::(\d+))?$/.exec(decoded);
+  if (!match) return null;
+  const type = match[1]!;
+  const databaseId = Number(match[2]);
+  const number = match[3] === undefined ? undefined : Number(match[3]);
+  if (graphQLId(type, databaseId, number) !== id) return null;
+  if (type === 'User') return graphQLObject('User', [...store.users.values()].find((user) => user.id === databaseId));
+  const repo = [...store.repos.values()].find((entry) => entry.id === databaseId);
+  if (!repo) return null;
+  if (type === 'Repository' && number === undefined) return graphQLObject(type, repo);
+  if (number === undefined) return null;
+  const value = type === 'Issue' ? repo.issues.get(number) : type === 'PullRequest' ? repo.pulls.get(number)
+    : type === 'IssueComment' ? repo.comments.get(number) : undefined;
+  return graphQLObject(type, value, repo);
+}
+
+function requireGraphQLNode(id: string, type: string): GraphQLObject {
+  const node = graphQLNode(id);
+  if (!node || node.type !== type) throw new Error(`Could not resolve ${type} node ${id}`);
+  return node;
+}
+
+function graphQLFirst(args: Record<string, any>): number {
+  const first = args.first ?? 30;
+  if (first < 0 || first > 100) throw new Error('Argument first must be between 0 and 100');
+  return first;
+}
+
+function graphQLIssues(repo: Repository, args: Record<string, any>): GraphQLObject {
+  let issues = [...repo.issues.values()];
+  if (args.states) issues = issues.filter((issue) => args.states.includes(issue.state.toUpperCase()));
+  const order = args.orderBy ?? { field: 'CREATED_AT', direction: 'DESC' };
+  const key = (issue: Issue): number => order.field === 'COMMENTS' ? issue.comments
+    : Date.parse(order.field === 'UPDATED_AT' ? issue.updated_at : issue.created_at);
+  issues.sort((a, b) => (key(a) - key(b) || a.number - b.number) * (order.direction === 'ASC' ? 1 : -1));
+  let start = 0;
+  if (args.after !== undefined && args.after !== null) {
+    const index = issues.findIndex((issue) => graphQLId('IssueCursor', repo.id, issue.number) === args.after);
+    if (index < 0) throw new Error('Invalid issues cursor');
+    start = index + 1;
+  }
+  const page = issues.slice(start, start + graphQLFirst(args));
+  const last = page[page.length - 1];
+  return graphQLObject('IssueConnection', {
+    nodes: page.map((issue) => graphQLObject('Issue', issue, repo)),
+    pageInfo: graphQLObject('PageInfo', {
+      hasNextPage: start + page.length < issues.length,
+      endCursor: last ? graphQLId('IssueCursor', repo.id, last.number) : null,
+    }),
+  })!;
+}
+
+function graphQLPullFiles(repo: Repository, pull: PullRequest, args: Record<string, any>): GraphQLObject {
+  const headFiles = store.getFilesAtCommit(repo.branches.get(pull.head.ref) || pull.head.sha);
+  const baseFiles = store.getFilesAtCommit(repo.branches.get(pull.base.ref) || pull.base.sha);
+  const paths = [...new Set([...headFiles.keys(), ...baseFiles.keys()])].filter((path) => {
+    const head = headFiles.get(path);
+    const base = baseFiles.get(path);
+    return head?.sha !== base?.sha || head?.mode !== base?.mode;
+  }).sort();
+  return graphQLObject('PullRequestChangedFileConnection', {
+    nodes: paths.slice(0, graphQLFirst(args)).map((path) => graphQLObject('PullRequestChangedFile', { path })),
+  })!;
+}
+
+function resolveGraphQLMutation(name: string, input: Record<string, any>, viewer: User): GraphQLObject {
+  if (name === 'createIssue') {
+    const repo = requireGraphQLNode(input.repositoryId, 'Repository').value as Repository;
+    const issue = createIssueRecord(repo, viewer, input.title, input.body ?? '');
+    return graphQLObject('CreateIssuePayload', { issue: graphQLObject('Issue', issue, repo) })!;
+  }
+  if (name === 'closeIssue') {
+    const node = requireGraphQLNode(input.issueId, 'Issue');
+    const issue = node.value as Issue;
+    issue.state = 'closed';
+    issue.updated_at = new Date().toISOString();
+    return graphQLObject('CloseIssuePayload', { issue: node })!;
+  }
+  if (name === 'createPullRequest') {
+    const repo = requireGraphQLNode(input.repositoryId, 'Repository').value as Repository;
+    const pull = createPullRecord(repo, viewer, input.title, '', input.headRefName, input.baseRefName);
+    if (!pull) throw new Error('Invalid head or base branch');
+    return graphQLObject('CreatePullRequestPayload', { pullRequest: graphQLObject('PullRequest', pull, repo) })!;
+  }
+  if (name === 'mergePullRequest') {
+    const node = requireGraphQLNode(input.pullRequestId, 'PullRequest');
+    const pull = node.value as PullRequest;
+    if (pull.state !== 'open' || pull.merged) throw new Error('Pull request is not open');
+    if (!mergePullRecord(node.repo!, pull, viewer, undefined, input.mergeMethod ?? 'MERGE')) {
+      throw new Error('Pull request cannot be merged due to conflict');
+    }
+    return graphQLObject('MergePullRequestPayload', { pullRequest: node })!;
+  }
+  const subject = graphQLNode(input.subjectId);
+  if (!subject || (subject.type !== 'Issue' && subject.type !== 'PullRequest')) throw new Error('Could not resolve comment subject');
+  const comment = createCommentRecord(subject.repo!, viewer, subject.value, input.body);
+  return graphQLObject('AddCommentPayload', {
+    commentEdge: graphQLObject('IssueCommentEdge', { node: graphQLObject('IssueComment', comment, subject.repo) }),
+  })!;
+}
+
+function resolveGraphQLField(source: GraphQLObject, name: string, args: Record<string, any>, viewer: User): any {
+  if (name === '__typename') return source.type;
+  if (source.type === 'Query') {
+    if (name === 'viewer') return graphQLObject('User', viewer);
+    if (name === 'repository') return graphQLObject('Repository', store.getRepo(args.owner, args.name));
+    if (name === 'node') return graphQLNode(args.id);
+    return graphQLTypeKind(args.name) ? graphQLObject('__Type', { name: args.name }) : null;
+  }
+  if (source.type === 'Mutation') return resolveGraphQLMutation(name, args.input, viewer);
+  if (source.type === 'Repository') {
+    const repo = source.value as Repository;
+    if (name === 'id') return graphQLId('Repository', repo.id);
+    if (name === 'databaseId') return repo.id;
+    if (name === 'name') return repo.name;
+    if (name === 'nameWithOwner') return `${repo.owner}/${repo.name}`;
+    if (name === 'owner') return graphQLObject('User', { login: repo.owner });
+    if (name === 'defaultBranchRef') return repo.branches.has(repo.default_branch) ? graphQLObject('Ref', { name: repo.default_branch }) : null;
+    if (name === 'viewerPermission') return repo.owner.toLowerCase() === viewer.login.toLowerCase() ? 'ADMIN' : 'READ';
+    if (name === 'hasIssuesEnabled') return true;
+    if (name === 'issue') return graphQLObject('Issue', repo.issues.get(args.number), repo);
+    if (name === 'issues') return graphQLIssues(repo, args);
+    if (name === 'pullRequest') return graphQLObject('PullRequest', repo.pulls.get(args.number), repo);
+    return graphQLObject('PullRequestConnection', {
+      nodes: [...repo.pulls.values()].sort((a, b) => b.number - a.number).slice(0, graphQLFirst(args))
+        .map((pull) => graphQLObject('PullRequest', pull, repo)),
+    });
+  }
+  if (source.type === 'Issue') {
+    if (name === 'id') return graphQLId('Issue', source.repo!.id, source.value.number);
+    if (name === 'state') return source.value.state.toUpperCase();
+  }
+  if (source.type === 'PullRequest') {
+    const pull = source.value as PullRequest;
+    if (name === 'id') return graphQLId('PullRequest', source.repo!.id, pull.number);
+    if (name === 'state') return pull.merged ? 'MERGED' : pull.state.toUpperCase();
+    if (name === 'headRefName') return pull.head.ref;
+    if (name === 'baseRefName') return pull.base.ref;
+    if (name === 'mergeable') return pull.mergeable ? 'MERGEABLE' : 'CONFLICTING';
+    if (name === 'files') return graphQLPullFiles(source.repo!, pull, args);
+  }
+  if (source.type === 'IssueComment' && name === 'id') return graphQLId('IssueComment', source.repo!.id, source.value.id);
+  if (source.type === '__Type') {
+    const type = source.value.name as string;
+    if (name === 'kind') return graphQLTypeKind(type);
+    if (name === 'fields') return Object.hasOwn(GRAPHQL_FIELDS, type)
+      ? Object.keys(GRAPHQL_FIELDS[type]!).map((field) => graphQLObject('__Field', { name: field })) : null;
+    if (name === 'enumValues') return Object.hasOwn(GRAPHQL_ENUMS, type)
+      ? GRAPHQL_ENUMS[type]!.map((value) => graphQLObject('__EnumValue', { name: value })) : null;
+  }
+  return source.value[name];
+}
+
+function executeGraphQLSelections(
+  source: GraphQLObject,
+  selections: GraphQLSelection[],
+  variables: Record<string, unknown>,
+  fragments: GraphQLDocument['fragments'],
+  viewer: User,
+): Record<string, unknown> {
+  // Merge repeated response keys before resolving them, so a mutation is executed once.
+  const fields = new Map<string, GraphQLField>();
+  const collect = (entries: GraphQLSelection[]): void => {
+    for (const selection of entries) {
+      if (selection.kind !== 'field') {
+        const fragment = selection.kind === 'fragment' ? selection : fragments[selection.name]!;
+        if (fragment.type === source.type || fragment.type === 'Node') collect(fragment.selections);
+        continue;
+      }
+      const previous = fields.get(selection.alias);
+      if (previous) {
+        if (previous.name !== selection.name || JSON.stringify(previous.args) !== JSON.stringify(selection.args)) {
+          throw new Error(`Conflicting fields for response key ${selection.alias}`);
+        }
+        previous.selections.push(...selection.selections);
+      } else fields.set(selection.alias, { ...selection, selections: [...selection.selections] });
+    }
+  };
+  collect(selections);
+  const result: Record<string, unknown> = Object.create(null);
+  for (const field of fields.values()) {
+    const value = resolveGraphQLField(source, field.name, graphQLArguments(source.type, field, variables), viewer);
+    const project = (entry: any): unknown => entry === null || entry === undefined ? null : Array.isArray(entry)
+      ? entry.map(project) : typeof entry === 'object' ? executeGraphQLSelections(entry, field.selections, variables, fragments, viewer) : entry;
+    result[field.alias] = project(value);
+  }
+  return result;
+}
+
+function executeGraphQL(request: unknown, viewer: User): Record<string, unknown> {
+  try {
+    if (!graphQLRecord(request) || typeof request.query !== 'string') throw new Error('A GraphQL operation requires a query string');
+    if (request.variables !== undefined && request.variables !== null && !graphQLRecord(request.variables)) {
+      throw new Error('GraphQL variables must be an object');
+    }
+    if (request.operationName !== undefined && request.operationName !== null && typeof request.operationName !== 'string') {
+      throw new Error('GraphQL operationName must be a string');
+    }
+    const document = new GraphQLParser(request.query).parse();
+    const operation = request.operationName ? document.operations.find((entry) => entry.name === request.operationName)
+      : document.operations.length === 1 ? document.operations[0] : undefined;
+    if (!operation) throw new Error(request.operationName ? `Unknown operation ${request.operationName}` : 'An operationName is required for multiple operations');
+    const variables: Record<string, unknown> = Object.create(null);
+    for (const variable of operation.variables) {
+      const value = Object.hasOwn(request.variables ?? {}, variable.name) ? request.variables[variable.name]
+        : variable.defaultValue ? graphQLInput(variable.defaultValue, {}) : undefined;
+      variables[variable.name] = coerceGraphQLInput(value, variable.type, `Variable $${variable.name}`);
+    }
+    const type = operation.type === 'mutation' ? 'Mutation' : 'Query';
+    // Validate the entire selection tree before reads or writes, including nullable branches.
+    validateGraphQLSelections(type, operation.selections, variables, document.fragments);
+    return { data: executeGraphQLSelections(graphQLObject(type, {})!, operation.selections, variables, document.fragments, viewer) };
+  } catch (err) {
+    return { errors: [{ message: err instanceof Error ? err.message : String(err) }] };
+  }
+}
+
+async function handleGraphQL(req: IncomingMessage, res: ServerResponse, reqId: string): Promise<void> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !/^Bearer\s+(.+)$/i.test(authHeader) || authHeader.replace(/^Bearer\s+/i, '').trim() !== EXPECTED_TOKEN) {
+    sendJson(res, 401, { message: 'Bad credentials' }, {}, reqId);
+    return;
+  }
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { message: 'Method Not Allowed' }, { allow: 'POST' }, reqId);
+    return;
+  }
+  let body: unknown;
+  try { body = JSON.parse(await readBody(req)); }
+  catch { sendJson(res, 400, { message: 'Problems parsing JSON' }, {}, reqId); return; }
+  const viewer = store.users.get('adaiversen')!;
+  sendJson(res, 200, Array.isArray(body) ? body.map((operation) => executeGraphQL(operation, viewer)) : executeGraphQL(body, viewer), {}, reqId);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Git Smart HTTP Handlers
 
@@ -1316,10 +2066,12 @@ async function handleUploadPack(
     }
   }
 
+  // A shallow client's haves include their trees, but not history beyond its boundary.
+  const shallowSet = new Set(shallow);
   const haveOids = new Set<string>();
   for (const h of haves) {
     if (store.objects.has(h)) {
-      collectReachable([h], (oid) => store.objects.get(oid), haveOids);
+      collectReachable([h], (oid) => store.objects.get(oid), haveOids, shallowSet);
     }
   }
 
@@ -1358,12 +2110,13 @@ async function handleUploadPack(
     if (walkVisited.has(oid)) continue;
     walkVisited.add(oid);
 
-    if (haveOids.has(oid)) continue;
-
     const obj = store.objects.get(oid);
     if (!obj) continue;
 
-    objectsToSend.set(oid, obj);
+    const alreadyHave = haveOids.has(oid);
+    // Deepening must walk through a held tip to reach the newly requested parents.
+    if (alreadyHave && (deepen === undefined || obj.type !== 'commit')) continue;
+    if (!alreadyHave) objectsToSend.set(oid, obj);
 
     if (obj.type === 'commit') {
       const commit = parseCommit(obj.data);
@@ -1374,7 +2127,7 @@ async function handleUploadPack(
           for (const p of commit.parents) walkQueue.push(p);
         }
       } else {
-        if (!shallow.includes(oid)) {
+        if (!shallowSet.has(oid)) {
           for (const p of commit.parents) walkQueue.push(p);
         }
       }
@@ -1660,6 +2413,11 @@ export function createApp(): Server {
     // Boot probe
     if (method === 'GET' && path === '/healthz') {
       sendJson(res, 200, { ok: true }, {}, reqId);
+      return;
+    }
+
+    if (path === '/api/graphql') {
+      await handleGraphQL(req, res, reqId);
       return;
     }
 
@@ -2522,20 +3280,7 @@ export function createApp(): Server {
           }
         }
 
-        const issueNum = ++repo.issueCounter;
-        const now = new Date().toISOString();
-        const issue: Issue = {
-          number: issueNum,
-          title,
-          body: issueBody,
-          state: 'open',
-          labels: labelsInput,
-          comments: 0,
-          created_at: now,
-          updated_at: now,
-          user: { login: viewer.login, id: viewer.id },
-        };
-        repo.issues.set(issueNum, issue);
+        const issue = createIssueRecord(repo, viewer, title, issueBody, labelsInput);
         sendJson(res, 201, issueJson(issue, repo), {}, reqId);
         return;
       }
@@ -2596,19 +3341,7 @@ export function createApp(): Server {
 
       if (method === 'POST') {
         const commentBody = String(body.body || '');
-        const commentId = store.nextCommentId++;
-        const now = new Date().toISOString();
-        const comment: Comment = {
-          id: commentId,
-          body: commentBody,
-          issue_number: issueNum,
-          created_at: now,
-          updated_at: now,
-          user: { login: viewer.login, id: viewer.id },
-        };
-        repo.comments.set(commentId, comment);
-        issue.comments++;
-        issue.updated_at = now;
+        const comment = createCommentRecord(repo, viewer, issue, commentBody);
         sendJson(res, 201, comment, {}, reqId);
         return;
       }
@@ -2726,29 +3459,12 @@ export function createApp(): Server {
         const head = String(body.head || '');
         const base = String(body.base || '');
 
-        const headSha = repo.branches.get(head) || repo.refs.get(head);
-        const baseSha = repo.branches.get(base) || repo.refs.get(base);
-        if (!headSha || !baseSha) {
+        const pull = createPullRecord(repo, viewer, title, pullBody, head, base);
+        if (!pull) {
           sendJson(res, 422, { message: 'Invalid head or base branch' }, {}, reqId);
           return;
         }
 
-        const pullNum = ++repo.pullCounter;
-        const now = new Date().toISOString();
-        const pull: PullRequest = {
-          number: pullNum,
-          title,
-          body: pullBody,
-          state: 'open',
-          head: { ref: head, sha: headSha },
-          base: { ref: base, sha: baseSha },
-          merged: false,
-          mergeable: true,
-          created_at: now,
-          updated_at: now,
-          user: { login: viewer.login, id: viewer.id },
-        };
-        repo.pulls.set(pullNum, pull);
         sendJson(res, 201, pullJson(pull, repo), {}, reqId);
         return;
       }
@@ -2860,63 +3576,11 @@ export function createApp(): Server {
         return;
       }
 
-      const currentBaseSha = repo.branches.get(pull.base.ref) || pull.base.sha;
-      const currentHeadSha = repo.branches.get(pull.head.ref) || pull.head.sha;
-
-      const ancestorSha = store.findCommonAncestor(currentBaseSha, currentHeadSha) || pull.base.sha;
-      const ancestorFiles = store.getFilesAtCommit(ancestorSha);
-      const baseFiles = store.getFilesAtCommit(currentBaseSha);
-      const headFiles = store.getFilesAtCommit(currentHeadSha);
-
-      // Conflict detection: both base and head changed the same file differently
-      let conflict = false;
-      const allPaths = new Set([...ancestorFiles.keys(), ...baseFiles.keys(), ...headFiles.keys()]);
-      for (const p of allPaths) {
-        const aSha = ancestorFiles.get(p)?.sha;
-        const bSha = baseFiles.get(p)?.sha;
-        const hSha = headFiles.get(p)?.sha;
-        if (bSha !== aSha && hSha !== aSha && bSha !== hSha) {
-          conflict = true;
-          break;
-        }
-      }
-
-      if (conflict) {
+      const mergeCommit = mergePullRecord(repo, pull, viewer, body.commit_title);
+      if (!mergeCommit) {
         sendJson(res, 405, { message: 'Pull request cannot be merged due to conflict' }, {}, reqId);
         return;
       }
-
-      // Merge files: apply head changes onto base files
-      const mergedFiles = new Map<string, { sha: string; mode: string }>(baseFiles);
-      for (const [p, hEntry] of headFiles) {
-        mergedFiles.set(p, hEntry);
-      }
-      for (const [p] of ancestorFiles) {
-        if (!headFiles.has(p) && baseFiles.get(p)?.sha === ancestorFiles.get(p)?.sha) {
-          mergedFiles.delete(p);
-        }
-      }
-
-      const newTreeSha = store.buildTreeFromFiles(mergedFiles);
-      const commitTitle = body.commit_title || `Merge pull request #${pull.number} from ${pull.head.ref}`;
-      const mergeCommit = store.saveCommit(
-        newTreeSha,
-        [currentBaseSha],
-        commitTitle,
-        { name: viewer.name, email: viewer.email, date: new Date().toISOString() },
-        { name: viewer.name, email: viewer.email, date: new Date().toISOString() },
-      );
-
-      // Advance base branch
-      repo.branches.set(pull.base.ref, mergeCommit.sha);
-      repo.refs.set(`refs/heads/${pull.base.ref}`, mergeCommit.sha);
-
-      // Update pull request
-      pull.state = 'closed';
-      pull.merged = true;
-      pull.merged_at = new Date().toISOString();
-      pull.merge_commit_sha = mergeCommit.sha;
-      pull.updated_at = pull.merged_at;
 
       sendJson(
         res,
