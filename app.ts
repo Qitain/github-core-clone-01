@@ -3,6 +3,7 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { deflateSync, inflateSync } from 'node:zlib';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const DEFAULT_TOKEN = 'test-token';
@@ -110,6 +111,541 @@ interface Repository {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Git Smart HTTP Types & Protocol
+
+type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
+
+const TYPE_CODE: Readonly<Record<GitObjectType, number>> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+const CODE_TYPE: Readonly<Record<number, GitObjectType>> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
+const ZERO_OID = '0'.repeat(40);
+const PKT_LINE_MAX = 65520;
+const PKT_LINE_MAX_PAYLOAD = PKT_LINE_MAX - 4;
+
+function asBuffer(value: string | Uint8Array): Buffer {
+  if (typeof value === 'string') return Buffer.from(value, 'utf8');
+  if (Buffer.isBuffer(value)) return value;
+  return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+}
+
+function encodePktLine(payload: string | Uint8Array): Buffer {
+  const data = asBuffer(payload);
+  if (data.length > PKT_LINE_MAX_PAYLOAD) {
+    throw new Error(`pkt-line payload is ${data.length} bytes, over max`);
+  }
+  const header = Buffer.allocUnsafe(4);
+  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  return Buffer.concat([header, data]);
+}
+
+function encodePktLines(items: ReadonlyArray<string | Uint8Array | 'flush' | 'delim' | 'response-end'>): Buffer {
+  const parts: Buffer[] = [];
+  for (const item of items) {
+    if (item === 'flush') parts.push(Buffer.from('0000', 'ascii'));
+    else if (item === 'delim') parts.push(Buffer.from('0001', 'ascii'));
+    else if (item === 'response-end') parts.push(Buffer.from('0002', 'ascii'));
+    else parts.push(encodePktLine(item));
+  }
+  return Buffer.concat(parts);
+}
+
+function encodeSideband(band: number, data: Buffer): Buffer[] {
+  const maxChunk = 65515;
+  const packets: Buffer[] = [];
+  let offset = 0;
+  while (offset < data.length) {
+    const chunk = data.subarray(offset, offset + maxChunk);
+    const payload = Buffer.concat([Buffer.from([band]), chunk]);
+    packets.push(encodePktLine(payload));
+    offset += chunk.length;
+  }
+  return packets;
+}
+
+type GitPacket =
+  | { readonly kind: 'data'; readonly payload: Buffer; readonly raw: Buffer }
+  | { readonly kind: 'flush' }
+  | { readonly kind: 'delim' }
+  | { readonly kind: 'response-end' };
+
+function decodePktLines(bytes: Uint8Array): GitPacket[] {
+  const buffer = asBuffer(bytes);
+  const packets: GitPacket[] = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    if (offset + 4 > buffer.length) {
+      throw new Error(`truncated pkt-line header: ${buffer.length - offset} bytes`);
+    }
+    const hex = buffer.subarray(offset, offset + 4).toString('ascii');
+    if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
+      throw new Error(`invalid pkt-line length header ${hex}`);
+    }
+    const len = parseInt(hex, 16);
+    if (len === 0) {
+      packets.push({ kind: 'flush' });
+      offset += 4;
+    } else if (len === 1) {
+      packets.push({ kind: 'delim' });
+      offset += 4;
+    } else if (len === 2) {
+      packets.push({ kind: 'response-end' });
+      offset += 4;
+    } else if (len < 4 || len > PKT_LINE_MAX) {
+      throw new Error(`invalid pkt-line length ${len}`);
+    } else {
+      if (offset + len > buffer.length) {
+        throw new Error(`truncated pkt-line: announced ${len}, available ${buffer.length - offset}`);
+      }
+      const raw = buffer.subarray(offset, offset + len);
+      packets.push({ kind: 'data', payload: raw.subarray(4), raw });
+      offset += len;
+    }
+  }
+  return packets;
+}
+
+function objectHeader(type: GitObjectType, size: number): Buffer {
+  return Buffer.from(`${type} ${size}\0`, 'utf8');
+}
+
+function hashObject(type: GitObjectType, data: Uint8Array): string {
+  const body = asBuffer(data);
+  const hash = createHash('sha1');
+  hash.update(objectHeader(type, body.length));
+  hash.update(body);
+  return hash.digest('hex');
+}
+
+interface TreeEntry {
+  readonly mode: string;
+  readonly name: string;
+  readonly oid: string;
+}
+
+function parseTree(data: Uint8Array): TreeEntry[] {
+  const buffer = asBuffer(data);
+  const entries: TreeEntry[] = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const space = buffer.indexOf(0x20, offset);
+    if (space < 0) throw new Error('tree entry has no mode separator');
+    const nul = buffer.indexOf(0x00, space + 1);
+    if (nul < 0) throw new Error('tree entry has no name terminator');
+    if (nul + 21 > buffer.length) throw new Error('tree entry has a truncated object id');
+    const mode = buffer.subarray(offset, space).toString('ascii');
+    const name = buffer.subarray(space + 1, nul).toString('utf8');
+    const oid = buffer.subarray(nul + 1, nul + 21).toString('hex');
+    entries.push({ mode, name, oid });
+    offset = nul + 21;
+  }
+  return entries;
+}
+
+interface CommitView {
+  readonly tree: string;
+  readonly parents: string[];
+  readonly author: string;
+  readonly committer: string;
+  readonly message: string;
+}
+
+function parseCommit(data: Uint8Array): CommitView {
+  const buffer = asBuffer(data);
+  const blank = buffer.indexOf('\n\n');
+  const headerEnd = blank < 0 ? buffer.length : blank;
+  const headerText = buffer.subarray(0, headerEnd).toString('utf8');
+  const message = blank < 0 ? '' : buffer.subarray(blank + 2).toString('utf8');
+  let tree = '';
+  const parents: string[] = [];
+  let author = '';
+  let committer = '';
+  for (const line of headerText.split('\n')) {
+    if (!line) continue;
+    const space = line.indexOf(' ');
+    const key = space < 0 ? line : line.slice(0, space);
+    const value = space < 0 ? '' : line.slice(space + 1);
+    if (key === 'tree') tree = value;
+    else if (key === 'parent') parents.push(value);
+    else if (key === 'author') author = value;
+    else if (key === 'committer') committer = value;
+  }
+  return { tree, parents, author, committer, message };
+}
+
+interface TagView {
+  readonly object: string;
+  readonly type: GitObjectType;
+  readonly tag: string;
+  readonly tagger: string;
+  readonly message: string;
+}
+
+function parseTag(data: Uint8Array): TagView {
+  const buffer = asBuffer(data);
+  const blank = buffer.indexOf('\n\n');
+  const headerEnd = blank < 0 ? buffer.length : blank;
+  const headers = new Map<string, string>();
+  for (const line of buffer.subarray(0, headerEnd).toString('utf8').split('\n')) {
+    if (!line) continue;
+    const space = line.indexOf(' ');
+    if (space < 0) continue;
+    headers.set(line.slice(0, space), line.slice(space + 1));
+  }
+  return {
+    object: headers.get('object') ?? '',
+    type: (headers.get('type') ?? 'commit') as GitObjectType,
+    tag: headers.get('tag') ?? '',
+    tagger: headers.get('tagger') ?? '',
+    message: blank < 0 ? '' : buffer.subarray(blank + 2).toString('utf8'),
+  };
+}
+
+function parseIdentity(line: string): { name: string; email: string; date: string } {
+  const match = /^([^<]+?)\s*<([^>]+)>\s*(\d+)\s*([+-]\d{4})?$/.exec(line.trim());
+  if (match) {
+    const timestamp = parseInt(match[3]!, 10);
+    return {
+      name: match[1]!.trim(),
+      email: match[2]!.trim(),
+      date: new Date(timestamp * 1000).toISOString(),
+    };
+  }
+  return {
+    name: 'Unknown',
+    email: 'unknown@example.com',
+    date: new Date().toISOString(),
+  };
+}
+
+function readVarintSize(buffer: Buffer, start: number): { size: number; next: number; first: number } {
+  if (start >= buffer.length) throw new Error('pack entry has no size header');
+  let byte = buffer[start]!;
+  const first = byte;
+  let size = byte & 0x0f;
+  let shift = 4;
+  let offset = start + 1;
+  while (byte & 0x80) {
+    if (offset >= buffer.length) throw new Error('pack entry size varint is truncated');
+    byte = buffer[offset++]!;
+    size += (byte & 0x7f) * 2 ** shift;
+    shift += 7;
+    if (shift > 63) throw new Error('pack entry size varint is too long');
+  }
+  return { size, next: offset, first };
+}
+
+function readOfsDeltaBase(buffer: Buffer, start: number): { baseOffset: number; next: number } {
+  if (start >= buffer.length) throw new Error('ofs-delta has no base offset');
+  let byte = buffer[start]!;
+  let offset = start + 1;
+  let value = byte & 0x7f;
+  while (byte & 0x80) {
+    if (offset >= buffer.length) throw new Error('ofs-delta base offset is truncated');
+    byte = buffer[offset++]!;
+    value = ((value + 1) * 128) + (byte & 0x7f);
+  }
+  return { baseOffset: value, next: offset };
+}
+
+function inflateAt(buffer: Uint8Array, offset: number): { data: Buffer; next: number } {
+  const view = asBuffer(buffer).subarray(offset);
+  let result: { buffer: Buffer; engine: { bytesWritten: number } };
+  try {
+    result = inflateSync(view, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+  } catch (err) {
+    throw new Error(`zlib stream at offset ${offset} did not inflate: ${(err as Error).message}`);
+  }
+  const written = result.engine.bytesWritten;
+  if (!written || written <= 0) throw new Error(`zlib stream at offset ${offset} consumed no bytes`);
+  return { data: result.buffer, next: offset + written };
+}
+
+function applyDelta(base: Uint8Array, delta: Uint8Array): Buffer {
+  const baseBuffer = asBuffer(base);
+  const deltaBuffer = asBuffer(delta);
+  let offset = 0;
+  const readSize = (): number => {
+    let value = 0;
+    let shift = 0;
+    for (;;) {
+      if (offset >= deltaBuffer.length) throw new Error('delta size varint is truncated');
+      const byte = deltaBuffer[offset++]!;
+      value += (byte & 0x7f) * 2 ** shift;
+      shift += 7;
+      if (!(byte & 0x80)) break;
+      if (shift > 63) throw new Error('delta size varint is too long');
+    }
+    return value;
+  };
+  const sourceSize = readSize();
+  const targetSize = readSize();
+  if (sourceSize !== baseBuffer.length) {
+    throw new Error(`delta expects a ${sourceSize}-byte base, got ${baseBuffer.length}`);
+  }
+  const out = Buffer.allocUnsafe(targetSize);
+  let written = 0;
+  while (offset < deltaBuffer.length) {
+    const op = deltaBuffer[offset++]!;
+    if (op & 0x80) {
+      let copyOffset = 0;
+      let copySize = 0;
+      let shift = 0;
+      for (let bit = 0; bit < 4; bit += 1) {
+        if (op & (1 << bit)) {
+          if (offset >= deltaBuffer.length) throw new Error('delta copy offset is truncated');
+          copyOffset += deltaBuffer[offset++]! * 2 ** shift;
+        }
+        shift += 8;
+      }
+      shift = 0;
+      for (let bit = 4; bit < 7; bit += 1) {
+        if (op & (1 << bit)) {
+          if (offset >= deltaBuffer.length) throw new Error('delta copy size is truncated');
+          copySize += deltaBuffer[offset++]! * 2 ** shift;
+        }
+        shift += 8;
+      }
+      if (copySize === 0) copySize = 0x10000;
+      if (copyOffset + copySize > baseBuffer.length) throw new Error('delta copy is out of base');
+      if (written + copySize > targetSize) throw new Error('delta writes past target size');
+      baseBuffer.copy(out, written, copyOffset, copyOffset + copySize);
+      written += copySize;
+    } else if (op !== 0) {
+      const literal = op & 0x7f;
+      if (offset + literal > deltaBuffer.length) throw new Error('delta insert is truncated');
+      if (written + literal > targetSize) throw new Error('delta writes past target size');
+      deltaBuffer.copy(out, written, offset, offset + literal);
+      offset += literal;
+      written += literal;
+    } else {
+      throw new Error('delta opcode 0 is invalid');
+    }
+  }
+  if (written !== targetSize) throw new Error(`delta produced ${written} of ${targetSize} bytes`);
+  return out;
+}
+
+interface PackReadResult {
+  readonly version: number;
+  readonly declaredCount: number;
+  readonly objects: Map<string, { type: GitObjectType; data: Buffer }>;
+  readonly checksumOk: boolean;
+}
+
+function readPack(pack: Uint8Array, options: { resolveBase?: (oid: string) => { type: GitObjectType; data: Buffer } | undefined } = {}): PackReadResult {
+  const buffer = asBuffer(pack);
+  if (buffer.length < 32) throw new Error(`pack is ${buffer.length} bytes, too short`);
+  if (buffer.subarray(0, 4).toString('ascii') !== 'PACK') {
+    throw new Error('pack does not start with PACK');
+  }
+  const version = buffer.readUInt32BE(4);
+  if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
+  const declaredCount = buffer.readUInt32BE(8);
+  const trailerStart = buffer.length - 20;
+  const trailer = buffer.subarray(trailerStart).toString('hex');
+  const computedTrailer = createHash('sha1').update(buffer.subarray(0, trailerStart)).digest('hex');
+  const checksumOk = trailer === computedTrailer;
+
+  interface RawEntry {
+    offset: number;
+    typeCode: number;
+    size: number;
+    data: Buffer;
+    baseOffset?: number;
+    baseOid?: string;
+    resolvedType?: GitObjectType;
+    resolved?: Buffer;
+    oid?: string;
+  }
+
+  const raw: RawEntry[] = [];
+  const byOffset = new Map<number, RawEntry>();
+  let offset = 12;
+  for (let index = 0; index < declaredCount; index += 1) {
+    const entryOffset = offset;
+    const header = readVarintSize(buffer, offset);
+    offset = header.next;
+    const typeCode = (header.first >> 4) & 0x07;
+    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
+    if (typeCode === 6) {
+      const base = readOfsDeltaBase(buffer, offset);
+      offset = base.next;
+      if (base.baseOffset <= 0 || base.baseOffset > entryOffset) {
+        throw new Error(`ofs-delta at ${entryOffset} names an invalid base offset`);
+      }
+      entry.baseOffset = entryOffset - base.baseOffset;
+    } else if (typeCode === 7) {
+      if (offset + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
+      entry.baseOid = buffer.subarray(offset, offset + 20).toString('hex');
+      offset += 20;
+    } else if (!CODE_TYPE[typeCode]) {
+      throw new Error(`pack entry ${index} has unknown type code ${typeCode}`);
+    }
+    const inflated = inflateAt(buffer.subarray(0, trailerStart), offset);
+    if (inflated.data.length !== header.size) {
+      throw new Error(`pack entry declared ${header.size} bytes, inflated to ${inflated.data.length}`);
+    }
+    entry.data = inflated.data;
+    offset = inflated.next;
+    raw.push(entry);
+    byOffset.set(entryOffset, entry);
+  }
+
+  const objects = new Map<string, { type: GitObjectType; data: Buffer }>();
+  const resolving = new Set<number>();
+  const resolvedByOid = new Map<string, RawEntry>();
+
+  const resolve = (entry: RawEntry): { type: GitObjectType; data: Buffer; oid: string } => {
+    if (entry.resolved && entry.resolvedType && entry.oid) {
+      return { type: entry.resolvedType, data: entry.resolved, oid: entry.oid };
+    }
+    if (resolving.has(entry.offset)) throw new Error(`delta cycle at pack offset ${entry.offset}`);
+    resolving.add(entry.offset);
+    let type: GitObjectType;
+    let data: Buffer;
+    if (entry.typeCode === 6) {
+      const baseEntry = byOffset.get(entry.baseOffset!);
+      if (!baseEntry) throw new Error(`ofs-delta base at offset ${entry.baseOffset} not in pack`);
+      const base = resolve(baseEntry);
+      type = base.type;
+      data = applyDelta(base.data, entry.data);
+    } else if (entry.typeCode === 7) {
+      const wanted = entry.baseOid!;
+      const baseEntry = resolvedByOid.get(wanted);
+      if (baseEntry) {
+        const base = resolve(baseEntry);
+        type = base.type;
+        data = applyDelta(base.data, entry.data);
+      } else {
+        const external = options.resolveBase?.(wanted);
+        if (!external) {
+          throw new Error(`ref-delta base ${wanted} not found`);
+        }
+        type = external.type;
+        data = applyDelta(external.data, entry.data);
+      }
+    } else {
+      type = CODE_TYPE[entry.typeCode]!;
+      data = entry.data;
+    }
+    const oid = hashObject(type, data);
+    entry.resolved = data;
+    entry.resolvedType = type;
+    entry.oid = oid;
+    resolvedByOid.set(oid, entry);
+    resolving.delete(entry.offset);
+    return { type, data, oid };
+  };
+
+  for (const entry of raw) {
+    const resolved = resolve(entry);
+    if (!objects.has(resolved.oid)) objects.set(resolved.oid, { type: resolved.type, data: resolved.data });
+  }
+
+  return { version, declaredCount, objects, checksumOk };
+}
+
+function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
+  const code = TYPE_CODE[type];
+  const bytes: number[] = [];
+  let remaining = size;
+  let first = (code << 4) | (remaining & 0x0f);
+  remaining = Math.floor(remaining / 16);
+  while (remaining > 0) {
+    bytes.push(first | 0x80);
+    first = remaining & 0x7f;
+    remaining = Math.floor(remaining / 128);
+  }
+  bytes.push(first);
+  return Buffer.from(bytes);
+}
+
+function writePack(objects: Iterable<{ type: GitObjectType; data: Uint8Array }>): Buffer {
+  const list = [...objects];
+  const parts: Buffer[] = [];
+  const header = Buffer.allocUnsafe(12);
+  header.write('PACK', 0, 4, 'ascii');
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(list.length, 8);
+  parts.push(header);
+  for (const object of list) {
+    const data = asBuffer(object.data);
+    parts.push(writePackObjectHeader(object.type, data.length));
+    parts.push(deflateSync(data));
+  }
+  const body = Buffer.concat(parts);
+  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+}
+
+function collectReachable(
+  roots: Iterable<string>,
+  lookup: (oid: string) => { type: GitObjectType; data: Buffer } | undefined,
+  seen: Set<string> = new Set<string>(),
+): Set<string> {
+  const queue: string[] = [];
+  for (const root of roots) if (root && root !== ZERO_OID) queue.push(root);
+  while (queue.length) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    const object = lookup(oid);
+    if (!object) continue;
+    seen.add(oid);
+    if (object.type === 'commit') {
+      const commit = parseCommit(object.data);
+      queue.push(commit.tree);
+      for (const parent of commit.parents) queue.push(parent);
+    } else if (object.type === 'tag') {
+      queue.push(parseTag(object.data).object);
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) {
+        if (entry.mode === '160000') continue;
+        queue.push(entry.oid);
+      }
+    }
+  }
+  return seen;
+}
+
+function isAncestor(ancestorSha: string, descendantSha: string): boolean {
+  if (ancestorSha === descendantSha) return true;
+  const visited = new Set<string>();
+  const queue = [descendantSha];
+  while (queue.length > 0) {
+    const curr = queue.shift()!;
+    if (curr === ancestorSha) return true;
+    if (visited.has(curr)) continue;
+    visited.add(curr);
+    const commit = store.commits.get(curr);
+    if (commit) {
+      for (const p of commit.parents) queue.push(p);
+    }
+  }
+  return false;
+}
+
+function readBodyBuffer(req: IncomingMessage): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function getPeeledSha(oid: string): string | null {
+  const obj = store.objects.get(oid);
+  if (!obj || obj.type !== 'tag') return null;
+  let curr = obj;
+  while (curr && curr.type === 'tag') {
+    const parsed = parseTag(curr.data);
+    const target = store.objects.get(parsed.object);
+    if (!target) return parsed.object;
+    if (target.type !== 'tag') return parsed.object;
+    curr = target;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------------------------
 // In-Memory Data Store
 
 class ForgeStore {
@@ -119,6 +655,7 @@ class ForgeStore {
   blobs = new Map<string, GitBlob>();
   trees = new Map<string, GitTree>();
   commits = new Map<string, GitCommit>();
+  objects = new Map<string, { type: GitObjectType; data: Buffer }>();
 
   nextUserId = 1000;
   nextRepoId = 5000;
@@ -202,6 +739,7 @@ class ForgeStore {
     const sha = createHash('sha1').update(Buffer.concat([header, data])).digest('hex');
     const blob: GitBlob = { sha, data, size: data.length };
     this.blobs.set(sha, blob);
+    this.objects.set(sha, { type: 'blob', data });
     return blob;
   }
 
@@ -221,6 +759,7 @@ class ForgeStore {
     const sha = createHash('sha1').update(Buffer.concat([header, body])).digest('hex');
     const tree: GitTree = { sha, entries: sorted };
     this.trees.set(sha, tree);
+    this.objects.set(sha, { type: 'tree', data: body });
     return tree;
   }
 
@@ -253,7 +792,46 @@ class ForgeStore {
       committer,
     };
     this.commits.set(sha, commit);
+    this.objects.set(sha, { type: 'commit', data: body });
     return commit;
+  }
+
+  saveBlobRaw(sha: string, data: Buffer): void {
+    this.objects.set(sha, { type: 'blob', data });
+    this.blobs.set(sha, { sha, data, size: data.length });
+  }
+
+  saveTreeRaw(sha: string, data: Buffer): void {
+    this.objects.set(sha, { type: 'tree', data });
+    const entries = parseTree(data);
+    this.trees.set(sha, {
+      sha,
+      entries: entries.map((e) => ({
+        mode: e.mode,
+        name: e.name,
+        sha: e.oid,
+        type: e.mode === '40000' ? 'tree' : 'blob',
+      })),
+    });
+  }
+
+  saveCommitRaw(sha: string, data: Buffer): void {
+    this.objects.set(sha, { type: 'commit', data });
+    const parsed = parseCommit(data);
+    const authorParsed = parseIdentity(parsed.author);
+    const committerParsed = parseIdentity(parsed.committer);
+    this.commits.set(sha, {
+      sha,
+      tree: parsed.tree,
+      parents: parsed.parents,
+      message: parsed.message,
+      author: authorParsed,
+      committer: committerParsed,
+    });
+  }
+
+  saveTagRaw(sha: string, data: Buffer): void {
+    this.objects.set(sha, { type: 'tag', data });
   }
 
   flattenTree(treeSha: string, prefix = ''): Map<string, { sha: string; mode: string }> {
@@ -497,6 +1075,579 @@ function pullJson(pull: PullRequest, repo: Repository): Record<string, unknown> 
 }
 
 // ---------------------------------------------------------------------------------------------
+// Git Smart HTTP Handlers
+
+function handleInfoRefs(
+  req: IncomingMessage,
+  res: ServerResponse,
+  repo: Repository,
+  service: string,
+): void {
+  if (service === 'git-upload-pack') {
+    const gitProtocol = req.headers['git-protocol'];
+    const isV2 = typeof gitProtocol === 'string' && gitProtocol.split(':').some((p) => p.trim() === 'version=2');
+
+    if (isV2) {
+      res.writeHead(200, {
+        'content-type': 'application/x-git-upload-pack-advertisement',
+        'cache-control': 'no-cache, max-age=0, must-revalidate',
+      });
+      res.end(
+        encodePktLines([
+          'version 2\n',
+          'agent=git/makefun\n',
+          'ls-refs=unborn\n',
+          'fetch=shallow\n',
+          'object-format=sha1\n',
+          'flush',
+        ]),
+      );
+      return;
+    }
+
+    // Protocol V0 upload-pack
+    const lines: Array<string | Buffer | 'flush'> = ['# service=git-upload-pack\n', 'flush'];
+    const branchEntries = [...repo.branches.entries()].sort(([a], [b]) => a.localeCompare(b));
+    const tagEntries = [...repo.refs.entries()]
+      .filter(([name]) => name.startsWith('refs/tags/'))
+      .sort(([a], [b]) => a.localeCompare(b));
+
+    const defaultBranch = repo.default_branch || 'main';
+    const headSha = repo.branches.get(defaultBranch) || (branchEntries.length > 0 ? branchEntries[0]![1] : null);
+
+    const v0Caps = `multi_ack_detailed no-done side-band-64k ofs-delta agent=git/makefun symref=HEAD:refs/heads/${defaultBranch} object-format=sha1`;
+
+    if (!headSha && branchEntries.length === 0 && tagEntries.length === 0) {
+      lines.push(
+        `0000000000000000000000000000000000000000 capabilities^{}\0multi_ack_detailed no-done side-band-64k ofs-delta agent=git/makefun object-format=sha1\n`,
+      );
+      lines.push('flush');
+    } else {
+      if (headSha) {
+        lines.push(`${headSha} HEAD\0${v0Caps}\n`);
+        for (const [bName, bSha] of branchEntries) {
+          lines.push(`${bSha} refs/heads/${bName}\n`);
+        }
+      } else {
+        const [firstBName, firstBSha] = branchEntries[0]!;
+        lines.push(`${firstBSha} refs/heads/${firstBName}\0${v0Caps}\n`);
+        for (let i = 1; i < branchEntries.length; i++) {
+          const [bName, bSha] = branchEntries[i]!;
+          lines.push(`${bSha} refs/heads/${bName}\n`);
+        }
+      }
+      for (const [tRef, tSha] of tagEntries) {
+        lines.push(`${tSha} ${tRef}\n`);
+        const peeled = getPeeledSha(tSha);
+        if (peeled) {
+          lines.push(`${peeled} ${tRef}^{}\n`);
+        }
+      }
+      lines.push('flush');
+    }
+
+    res.writeHead(200, {
+      'content-type': 'application/x-git-upload-pack-advertisement',
+      'cache-control': 'no-cache, max-age=0, must-revalidate',
+    });
+    res.end(encodePktLines(lines));
+    return;
+  }
+
+  if (service === 'git-receive-pack') {
+    const recvCaps = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta agent=git/makefun object-format=sha1';
+    const lines: Array<string | Buffer | 'flush'> = ['# service=git-receive-pack\n', 'flush'];
+    const branchEntries = [...repo.branches.entries()].sort(([a], [b]) => a.localeCompare(b));
+    const tagEntries = [...repo.refs.entries()]
+      .filter(([name]) => name.startsWith('refs/tags/'))
+      .sort(([a], [b]) => a.localeCompare(b));
+
+    if (branchEntries.length === 0 && tagEntries.length === 0) {
+      lines.push(`0000000000000000000000000000000000000000 capabilities^{}\0${recvCaps}\n`);
+      lines.push('flush');
+    } else {
+      let first = true;
+      for (const [bName, bSha] of branchEntries) {
+        if (first) {
+          lines.push(`${bSha} refs/heads/${bName}\0${recvCaps}\n`);
+          first = false;
+        } else {
+          lines.push(`${bSha} refs/heads/${bName}\n`);
+        }
+      }
+      for (const [tRef, tSha] of tagEntries) {
+        if (first) {
+          lines.push(`${tSha} ${tRef}\0${recvCaps}\n`);
+          first = false;
+        } else {
+          lines.push(`${tSha} ${tRef}\n`);
+        }
+        const peeled = getPeeledSha(tSha);
+        if (peeled) {
+          lines.push(`${peeled} ${tRef}^{}\n`);
+        }
+      }
+      lines.push('flush');
+    }
+
+    res.writeHead(200, {
+      'content-type': 'application/x-git-receive-pack-advertisement',
+      'cache-control': 'no-cache, max-age=0, must-revalidate',
+    });
+    res.end(encodePktLines(lines));
+    return;
+  }
+}
+
+async function handleUploadPack(
+  req: IncomingMessage,
+  res: ServerResponse,
+  repo: Repository,
+): Promise<void> {
+  const rawBody = await readBodyBuffer(req);
+  const packets = decodePktLines(rawBody);
+
+  const firstPacket = packets.find((p) => p.kind === 'data');
+  const firstLine = firstPacket && firstPacket.kind === 'data' ? firstPacket.payload.toString('utf8').replace(/\n$/, '') : '';
+
+  if (firstLine.startsWith('command=ls-refs')) {
+    let peel = false;
+    let symrefs = false;
+    let unborn = false;
+    const prefixes: string[] = [];
+
+    let inArgs = false;
+    for (const p of packets) {
+      if (p.kind === 'delim') {
+        inArgs = true;
+        continue;
+      }
+      if (!inArgs) continue;
+      if (p.kind === 'data') {
+        const text = p.payload.toString('utf8').replace(/\n$/, '');
+        if (text === 'peel') peel = true;
+        else if (text === 'symrefs') symrefs = true;
+        else if (text === 'unborn') unborn = true;
+        else if (text.startsWith('ref-prefix ')) {
+          prefixes.push(text.slice('ref-prefix '.length));
+        }
+      }
+    }
+
+    interface RefEntry {
+      name: string;
+      line: string;
+    }
+    const refCandidates: RefEntry[] = [];
+    const defaultBranch = repo.default_branch || 'main';
+    const headSha = repo.branches.get(defaultBranch);
+
+    if (repo.branches.size === 0) {
+      if (unborn) {
+        refCandidates.push({
+          name: 'HEAD',
+          line: `unborn HEAD symref-target:refs/heads/${defaultBranch}\n`,
+        });
+      }
+    } else {
+      if (headSha) {
+        const symrefPart = symrefs ? ` symref-target:refs/heads/${defaultBranch}` : '';
+        refCandidates.push({
+          name: 'HEAD',
+          line: `${headSha} HEAD${symrefPart}\n`,
+        });
+      }
+      for (const [bName, bSha] of [...repo.branches.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+        refCandidates.push({
+          name: `refs/heads/${bName}`,
+          line: `${bSha} refs/heads/${bName}\n`,
+        });
+      }
+      for (const [tRef, tSha] of [...repo.refs.entries()]
+        .filter(([name]) => name.startsWith('refs/tags/'))
+        .sort(([a], [b]) => a.localeCompare(b))) {
+        const peeled = getPeeledSha(tSha);
+        const peelPart = peel && peeled ? ` peeled:${peeled}` : '';
+        refCandidates.push({
+          name: tRef,
+          line: `${tSha} ${tRef}${peelPart}\n`,
+        });
+      }
+    }
+
+    const filtered = prefixes.length > 0
+      ? refCandidates.filter((r) => prefixes.some((pref) => r.name.startsWith(pref)))
+      : refCandidates;
+
+    const resLines: Array<string | 'flush'> = filtered.map((r) => r.line);
+    resLines.push('flush');
+
+    res.writeHead(200, {
+      'content-type': 'application/x-git-upload-pack-result',
+      'cache-control': 'no-cache, max-age=0, must-revalidate',
+    });
+    res.end(encodePktLines(resLines));
+    return;
+  }
+
+  // Fetch command (v2 or v0)
+  const isV2Fetch = firstLine.startsWith('command=fetch');
+
+  const wants: string[] = [];
+  const haves: string[] = [];
+  const shallow: string[] = [];
+  let deepen: number | undefined;
+  let doneSent = false;
+
+  for (const p of packets) {
+    if (p.kind !== 'data') continue;
+    const line = p.payload.toString('utf8').replace(/\n$/, '');
+    if (line.startsWith('want ')) {
+      const tokens = line.slice(5).trim().split(' ');
+      wants.push(tokens[0]!);
+    } else if (line.startsWith('have ')) {
+      haves.push(line.slice(5).trim());
+    } else if (line.startsWith('shallow ')) {
+      shallow.push(line.slice(8).trim());
+    } else if (line.startsWith('deepen ')) {
+      deepen = parseInt(line.slice(7).trim(), 10);
+    } else if (line === 'done') {
+      doneSent = true;
+    }
+  }
+
+  const haveOids = new Set<string>();
+  for (const h of haves) {
+    if (store.objects.has(h)) {
+      collectReachable([h], (oid) => store.objects.get(oid), haveOids);
+    }
+  }
+
+  let shallowReport: string[] = [];
+  let unshallowReport: string[] = [];
+  const visitedCommitDepths = new Map<string, number>();
+
+  if (deepen !== undefined && deepen > 0) {
+    const queue: Array<{ oid: string; depth: number }> = wants.map((w) => ({ oid: w, depth: 1 }));
+    const newShallowSet = new Set<string>();
+    while (queue.length > 0) {
+      const { oid, depth: d } = queue.shift()!;
+      if (visitedCommitDepths.has(oid)) continue;
+      visitedCommitDepths.set(oid, d);
+      const obj = store.objects.get(oid);
+      if (!obj || obj.type !== 'commit') continue;
+      if (d === deepen) {
+        newShallowSet.add(oid);
+        continue;
+      }
+      const commit = parseCommit(obj.data);
+      for (const p of commit.parents) {
+        queue.push({ oid: p, depth: d + 1 });
+      }
+    }
+    shallowReport = [...newShallowSet];
+    unshallowReport = shallow.filter((s) => visitedCommitDepths.has(s) && visitedCommitDepths.get(s)! < deepen);
+  }
+
+  const objectsToSend = new Map<string, { type: GitObjectType; data: Buffer }>();
+  const walkQueue = [...wants];
+  const walkVisited = new Set<string>();
+
+  while (walkQueue.length > 0) {
+    const oid = walkQueue.shift()!;
+    if (walkVisited.has(oid)) continue;
+    walkVisited.add(oid);
+
+    if (haveOids.has(oid)) continue;
+
+    const obj = store.objects.get(oid);
+    if (!obj) continue;
+
+    objectsToSend.set(oid, obj);
+
+    if (obj.type === 'commit') {
+      const commit = parseCommit(obj.data);
+      walkQueue.push(commit.tree);
+      if (deepen !== undefined) {
+        const d = visitedCommitDepths.get(oid);
+        if (d !== undefined && d < deepen) {
+          for (const p of commit.parents) walkQueue.push(p);
+        }
+      } else {
+        if (!shallow.includes(oid)) {
+          for (const p of commit.parents) walkQueue.push(p);
+        }
+      }
+    } else if (obj.type === 'tree') {
+      const entries = parseTree(obj.data);
+      for (const e of entries) {
+        if (e.mode === '160000') continue;
+        walkQueue.push(e.oid);
+      }
+    } else if (obj.type === 'tag') {
+      const tag = parseTag(obj.data);
+      walkQueue.push(tag.object);
+    }
+  }
+
+  const packBuffer = writePack(objectsToSend.values());
+  const sidebandPackets = encodeSideband(1, packBuffer);
+
+  res.writeHead(200, {
+    'content-type': 'application/x-git-upload-pack-result',
+    'cache-control': 'no-cache, max-age=0, must-revalidate',
+  });
+
+  if (isV2Fetch) {
+    // Protocol v2: when the client sends "done" the acknowledgments section is omitted and the
+    // response goes straight to shallow-info/packfile. Sending it anyway makes real git abort with
+    // "expected 'packfile', received 'acknowledgments'".
+    if (!doneSent) {
+      const matchingHaves = haves.filter((h) => store.objects.has(h));
+      const ackLines: Array<string | 'delim'> = ['acknowledgments\n'];
+      if (matchingHaves.length > 0) {
+        for (const h of matchingHaves) ackLines.push(`ACK ${h}\n`);
+        ackLines.push('ready\n');
+      } else {
+        ackLines.push('NAK\n');
+        ackLines.push('ready\n');
+      }
+      ackLines.push('delim');
+      res.write(encodePktLines(ackLines));
+    }
+
+    if (deepen !== undefined || shallowReport.length > 0 || unshallowReport.length > 0) {
+      const shallowLines: Array<string | 'delim'> = ['shallow-info\n'];
+      for (const s of shallowReport) shallowLines.push(`shallow ${s}\n`);
+      for (const u of unshallowReport) shallowLines.push(`unshallow ${u}\n`);
+      shallowLines.push('delim');
+      res.write(encodePktLines(shallowLines));
+    }
+
+    res.write(encodePktLine('packfile\n'));
+    for (const sp of sidebandPackets) res.write(sp);
+    res.end(Buffer.from('0000', 'ascii'));
+  } else {
+    // Protocol V0
+    if (shallowReport.length > 0 || unshallowReport.length > 0) {
+      for (const s of shallowReport) res.write(encodePktLine(`shallow ${s}\n`));
+      for (const u of unshallowReport) res.write(encodePktLine(`unshallow ${u}\n`));
+    }
+    const matchingHaves = haves.filter((h) => store.objects.has(h));
+    if (matchingHaves.length > 0) {
+      res.write(encodePktLine(`ACK ${matchingHaves[0]}\n`));
+    } else {
+      res.write(encodePktLine('NAK\n'));
+    }
+    for (const sp of sidebandPackets) res.write(sp);
+    res.end(Buffer.from('0000', 'ascii'));
+  }
+}
+
+async function handleReceivePack(
+  req: IncomingMessage,
+  res: ServerResponse,
+  repo: Repository,
+): Promise<void> {
+  const rawBody = await readBodyBuffer(req);
+
+  let offset = 0;
+  const commands: Array<{ oldOid: string; newOid: string; ref: string }> = [];
+  let pushCaps: string[] = [];
+
+  while (offset < rawBody.length) {
+    if (offset + 4 > rawBody.length) break;
+    const hex = rawBody.subarray(offset, offset + 4).toString('ascii');
+    if (hex === '0000') {
+      offset += 4;
+      break;
+    }
+    const len = parseInt(hex, 16);
+    if (isNaN(len) || len < 4 || offset + len > rawBody.length) {
+      throw new Error(`invalid receive-pack header ${hex}`);
+    }
+    const payload = rawBody.subarray(offset + 4, offset + len);
+    offset += len;
+    let text = payload.toString('utf8').replace(/\n$/, '');
+    if (commands.length === 0) {
+      const nulIdx = text.indexOf('\0');
+      if (nulIdx >= 0) {
+        pushCaps = text.slice(nulIdx + 1).split(' ').filter(Boolean);
+        text = text.slice(0, nulIdx);
+      }
+    }
+    const tokens = text.trim().split(' ');
+    if (tokens.length >= 3) {
+      commands.push({ oldOid: tokens[0]!, newOid: tokens[1]!, ref: tokens[2]! });
+    }
+  }
+
+  const packBytes = rawBody.subarray(offset);
+
+  let unpackOk = true;
+  let unpackDetail = 'ok';
+
+  if (packBytes.length > 0) {
+    try {
+      const packResult = readPack(packBytes, {
+        resolveBase: (oid) => store.objects.get(oid),
+      });
+      if (!packResult.checksumOk) {
+        unpackOk = false;
+        unpackDetail = 'pack checksum mismatch';
+      } else {
+        for (const [oid, obj] of packResult.objects) {
+          if (obj.type === 'blob') store.saveBlobRaw(oid, obj.data);
+          else if (obj.type === 'tree') store.saveTreeRaw(oid, obj.data);
+          else if (obj.type === 'commit') store.saveCommitRaw(oid, obj.data);
+          else if (obj.type === 'tag') store.saveTagRaw(oid, obj.data);
+        }
+      }
+    } catch (err) {
+      unpackOk = false;
+      unpackDetail = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  interface RefResult {
+    ref: string;
+    ok: boolean;
+    reason?: string;
+  }
+  const refResults: RefResult[] = [];
+
+  for (const cmd of commands) {
+    if (!unpackOk) {
+      refResults.push({ ref: cmd.ref, ok: false, reason: 'unpack-failed' });
+      continue;
+    }
+    if (cmd.newOid === ZERO_OID) {
+      // Delete
+      if (cmd.ref.startsWith('refs/heads/')) {
+        const bName = cmd.ref.slice('refs/heads/'.length);
+        repo.branches.delete(bName);
+        repo.refs.delete(cmd.ref);
+      } else if (cmd.ref.startsWith('refs/tags/')) {
+        repo.refs.delete(cmd.ref);
+      }
+      refResults.push({ ref: cmd.ref, ok: true });
+    } else if (cmd.oldOid === ZERO_OID) {
+      // Create
+      if (cmd.ref.startsWith('refs/heads/')) {
+        const bName = cmd.ref.slice('refs/heads/'.length);
+        repo.branches.set(bName, cmd.newOid);
+        repo.refs.set(cmd.ref, cmd.newOid);
+        if (!repo.branches.has(repo.default_branch)) {
+          repo.default_branch = bName;
+        }
+      } else if (cmd.ref.startsWith('refs/tags/')) {
+        repo.refs.set(cmd.ref, cmd.newOid);
+      }
+      refResults.push({ ref: cmd.ref, ok: true });
+    } else {
+      // Update: check fast-forward
+      if (!isAncestor(cmd.oldOid, cmd.newOid)) {
+        refResults.push({ ref: cmd.ref, ok: false, reason: 'non-fast-forward' });
+      } else {
+        if (cmd.ref.startsWith('refs/heads/')) {
+          const bName = cmd.ref.slice('refs/heads/'.length);
+          repo.branches.set(bName, cmd.newOid);
+          repo.refs.set(cmd.ref, cmd.newOid);
+        } else if (cmd.ref.startsWith('refs/tags/')) {
+          repo.refs.set(cmd.ref, cmd.newOid);
+        }
+        refResults.push({ ref: cmd.ref, ok: true });
+      }
+    }
+  }
+
+  const reportParts: Buffer[] = [
+    encodePktLine(`unpack ${unpackDetail}\n`),
+    ...refResults.map((r) => encodePktLine(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason}\n`)),
+    Buffer.from('0000', 'ascii'),
+  ];
+  const reportBytes = Buffer.concat(reportParts);
+
+  res.writeHead(200, {
+    'content-type': 'application/x-git-receive-pack-result',
+    'cache-control': 'no-cache, max-age=0, must-revalidate',
+  });
+
+  const sideband = pushCaps.includes('side-band-64k');
+  if (sideband) {
+    const sidebandPackets = encodeSideband(1, reportBytes);
+    for (const sp of sidebandPackets) res.write(sp);
+    res.end(Buffer.from('0000', 'ascii'));
+  } else {
+    res.end(reportBytes);
+  }
+}
+
+async function handleGitSmartHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  parsedUrl: URL,
+  gitMatch: RegExpExecArray,
+  reqId: string,
+): Promise<void> {
+  try {
+    const owner = decodeURIComponent(gitMatch[1]!);
+    const repoName = decodeURIComponent(gitMatch[2]!);
+    const action = gitMatch[3]!;
+    const method = req.method ?? 'GET';
+
+    // Auth check
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !/^Bearer\s+(.+)$/i.test(authHeader)) {
+      res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Bad credentials\n');
+      return;
+    }
+    const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+    if (token !== EXPECTED_TOKEN) {
+      res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Bad credentials\n');
+      return;
+    }
+
+    // Repository lookup
+    const repo = store.getRepo(owner, repoName);
+    if (!repo) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Repository not found\n');
+      return;
+    }
+
+    if (action === 'info/refs' && method === 'GET') {
+      const service = parsedUrl.searchParams.get('service');
+      if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
+        res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('Invalid or missing service\n');
+        return;
+      }
+      handleInfoRefs(req, res, repo, service);
+      return;
+    }
+
+    if (action === 'git-upload-pack' && method === 'POST') {
+      await handleUploadPack(req, res, repo);
+      return;
+    }
+
+    if (action === 'git-receive-pack' && method === 'POST') {
+      await handleReceivePack(req, res, repo);
+      return;
+    }
+
+    res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('Method Not Allowed\n');
+  } catch (err) {
+    res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end(`Bad Request: ${err instanceof Error ? err.message : String(err)}\n`);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Main Server Creation
 
 export function createApp(): Server {
@@ -509,6 +1660,13 @@ export function createApp(): Server {
     // Boot probe
     if (method === 'GET' && path === '/healthz') {
       sendJson(res, 200, { ok: true }, {}, reqId);
+      return;
+    }
+
+    // Git Smart HTTP routes
+    const gitMatch = /^\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
+    if (gitMatch) {
+      await handleGitSmartHttp(req, res, parsedUrl, gitMatch, reqId);
       return;
     }
 
