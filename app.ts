@@ -54,6 +54,7 @@ interface Label {
 }
 
 interface Issue {
+  id: number;
   number: number;
   title: string;
   body: string;
@@ -663,6 +664,7 @@ class ForgeStore {
   nextUserId = 1000;
   nextRepoId = 5000;
   nextLabelId = 1;
+  nextIssueId = 1;
   nextCommentId = 1;
 
   constructor() {
@@ -1040,6 +1042,7 @@ function issueJson(issue: Issue, repo: Repository): Record<string, unknown> {
     return { id: l?.id || 1, name, color: l?.color || 'ededed' };
   });
   return {
+    id: issue.id,
     number: issue.number,
     title: issue.title,
     body: issue.body,
@@ -1077,10 +1080,37 @@ function pullJson(pull: PullRequest, repo: Repository): Record<string, unknown> 
   return res;
 }
 
-// Shared writes for REST and GraphQL: both surfaces operate on the same records and git objects.
+// Shared writes for REST, GraphQL and MCP use the same records and git objects.
+function createRepoRecord(viewer: User, name: string, description = '', isPrivate = true, defaultBranch = 'main'): Repository {
+  const now = new Date().toISOString();
+  const repo: Repository = {
+    id: store.nextRepoId++,
+    owner: viewer.login,
+    name,
+    description,
+    private: isPrivate,
+    default_branch: defaultBranch,
+    created_at: now,
+    updated_at: now,
+    branches: new Map(),
+    refs: new Map(),
+    labels: new Map(),
+    issues: new Map(),
+    issueCounter: 0,
+    pulls: new Map(),
+    pullCounter: 0,
+    comments: new Map(),
+    commentCounter: 0,
+  };
+  store.repos.set(store.repoKey(repo.owner, repo.name), repo);
+  store.userRepoList.push(repo);
+  return repo;
+}
+
 function createIssueRecord(repo: Repository, viewer: User, title: string, body: string, labels: string[] = []): Issue {
   const now = new Date().toISOString();
   const issue: Issue = {
+    id: store.nextIssueId++,
     number: ++repo.issueCounter,
     title,
     body,
@@ -1825,6 +1855,228 @@ async function handleGraphQL(req: IncomingMessage, res: ServerResponse, reqId: s
 }
 
 // ---------------------------------------------------------------------------------------------
+// MCP over Streamable HTTP: request-local JSON-RPC dispatch with shared forge records.
+
+const MCP_PROTOCOL_VERSION = '2026-07-28';
+const MCP_SUPPORTED_VERSIONS: readonly string[] = Object.freeze([
+  MCP_PROTOCOL_VERSION, '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05',
+]);
+const MCP_SERVER_INFO = Object.freeze({ name: 'github-core-clone-01', version: '1.0.0' });
+const MCP_CAPABILITIES = Object.freeze({ tools: Object.freeze({}) });
+
+interface McpTool {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: {
+    readonly type: 'object';
+    readonly properties: Readonly<Record<string, { readonly type: 'string' | 'boolean' | 'integer' }>>;
+    readonly required: readonly string[];
+  };
+}
+
+const MCP_TOOLS: readonly McpTool[] = Object.freeze([
+  {
+    name: 'create_repo',
+    description: 'Create a repository owned by the authenticated user.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string' }, description: { type: 'string' }, private: { type: 'boolean' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'get_repo',
+    description: 'Read a repository by its owner and name.',
+    inputSchema: {
+      type: 'object',
+      properties: { owner: { type: 'string' }, repo: { type: 'string' } },
+      required: ['owner', 'repo'],
+    },
+  },
+  {
+    name: 'create_issue',
+    description: 'Create an open issue in a repository.',
+    inputSchema: {
+      type: 'object',
+      properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' } },
+      required: ['owner', 'repo', 'title'],
+    },
+  },
+  {
+    name: 'list_issues',
+    description: 'List repository issues, filtering by open, closed or all states without regard to case.',
+    inputSchema: {
+      type: 'object',
+      properties: { owner: { type: 'string' }, repo: { type: 'string' }, state: { type: 'string' } },
+      required: ['owner', 'repo'],
+    },
+  },
+  {
+    name: 'create_pull_request',
+    description: 'Open a pull request from an existing head branch into an existing base branch.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' },
+        head: { type: 'string' }, base: { type: 'string' }, body: { type: 'string' },
+      },
+      required: ['owner', 'repo', 'title', 'head', 'base'],
+    },
+  },
+  {
+    name: 'merge_pull_request',
+    description: 'Merge an open pull request, updating its base branch and merged state.',
+    inputSchema: {
+      type: 'object',
+      properties: { owner: { type: 'string' }, repo: { type: 'string' }, pull_number: { type: 'integer' } },
+      required: ['owner', 'repo', 'pull_number'],
+    },
+  },
+]);
+
+function mcpRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function mcpToolResult(value: unknown, isError = false): Record<string, unknown> {
+  return { content: [{ type: 'text', text: JSON.stringify(value) }], ...(isError ? { isError: true } : {}) };
+}
+
+function callMcpTool(name: string, args: Record<string, unknown>, viewer: User): Record<string, unknown> {
+  const toolError = (message: string): Record<string, unknown> => mcpToolResult({ message }, true);
+  if (name === 'create_repo') {
+    const repoName = (args.name as string).trim();
+    if (store.getRepo(viewer.login, repoName)) return toolError('Repository already exists');
+    const repo = createRepoRecord(viewer, repoName, args.description as string | undefined, args.private as boolean | undefined);
+    return mcpToolResult(repoJson(repo));
+  }
+
+  const repo = store.getRepo(args.owner as string, args.repo as string);
+  if (!repo) return toolError('Repository not found');
+  if (name === 'get_repo') return mcpToolResult(repoJson(repo));
+  if (name === 'create_issue') {
+    const issue = createIssueRecord(repo, viewer, args.title as string, (args.body as string | undefined) ?? '');
+    return mcpToolResult(issueJson(issue, repo));
+  }
+  if (name === 'list_issues') {
+    const state = ((args.state as string | undefined) ?? 'open').toLowerCase();
+    if (!['open', 'closed', 'all'].includes(state)) return toolError('state must be open, closed or all');
+    const issues = [...repo.issues.values()].filter((issue) => state === 'all' || issue.state === state);
+    issues.sort((a, b) => b.number - a.number);
+    return mcpToolResult(issues.map((issue) => issueJson(issue, repo)));
+  }
+  if (name === 'create_pull_request') {
+    const pull = createPullRecord(repo, viewer, args.title as string, (args.body as string | undefined) ?? '', args.head as string, args.base as string);
+    return pull ? mcpToolResult(pullJson(pull, repo)) : toolError('Invalid head or base branch');
+  }
+  const pull = repo.pulls.get(args.pull_number as number);
+  if (!pull) return toolError('Pull request not found');
+  if (pull.state !== 'open' || pull.merged) return toolError('Pull request is not open');
+  if (!mergePullRecord(repo, pull, viewer)) return toolError('Pull request cannot be merged due to conflict');
+  return mcpToolResult(pullJson(pull, repo));
+}
+
+async function handleMcp(req: IncomingMessage, res: ServerResponse, reqId: string): Promise<void> {
+  let id: string | number | null = null;
+  const rpcError = (code: number, message: string, status = 200, data?: unknown): void => {
+    sendJson(res, status, { jsonrpc: '2.0', id, error: { code, message, ...(data === undefined ? {} : { data }) } }, {}, reqId);
+  };
+  const rpcResult = (result: unknown): void => { sendJson(res, 200, { jsonrpc: '2.0', id, result }, {}, reqId); };
+  try {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { jsonrpc: '2.0', id, error: { code: -32600, message: 'Method Not Allowed' } }, { allow: 'POST' }, reqId);
+      return;
+    }
+    let request: unknown;
+    try { request = JSON.parse(await readBody(req)); }
+    catch { rpcError(-32700, 'Parse error', 400); return; }
+    if (!mcpRecord(request) || request.jsonrpc !== '2.0' || typeof request.method !== 'string' || request.method === ''
+      || (request.id !== undefined && request.id !== null && typeof request.id !== 'string'
+        && !(typeof request.id === 'number' && Number.isFinite(request.id)))) {
+      rpcError(-32600, 'Invalid request');
+      return;
+    }
+    id = (request.id as string | number | null | undefined) ?? null;
+
+    if (request.method === 'tools/call') {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !/^Bearer\s+(.+)$/i.test(authHeader) || authHeader.replace(/^Bearer\s+/i, '').trim() !== EXPECTED_TOKEN) {
+        rpcError(-32000, 'Bad credentials', 401);
+        return;
+      }
+    }
+    if (request.params !== undefined && !mcpRecord(request.params)) {
+      rpcError(-32602, 'params must be an object');
+      return;
+    }
+    const params = (request.params as Record<string, unknown> | undefined) ?? {};
+    const meta = mcpRecord(params._meta) ? params._meta : {};
+    const revision = meta['io.modelcontextprotocol/protocolVersion'] ?? meta.protocolVersion ?? req.headers['mcp-protocol-version'];
+    if (request.method !== 'initialize' && revision !== undefined
+      && (typeof revision !== 'string' || !MCP_SUPPORTED_VERSIONS.includes(revision))) {
+      rpcError(-32022, 'Unsupported protocol version', 400, { supported: MCP_SUPPORTED_VERSIONS });
+      return;
+    }
+    if (request.id === undefined) {
+      sendEmpty(res, 202, {}, reqId);
+      return;
+    }
+
+    switch (request.method) {
+      case 'server/discover':
+        if (revision !== undefined && revision !== MCP_PROTOCOL_VERSION) {
+          rpcError(-32601, 'Method not found');
+          return;
+        }
+        rpcResult({
+          supportedVersions: MCP_SUPPORTED_VERSIONS,
+          capabilities: MCP_CAPABILITIES,
+          serverInfo: MCP_SERVER_INFO,
+          _meta: { 'io.modelcontextprotocol/serverInfo': MCP_SERVER_INFO },
+        });
+        return;
+      case 'initialize': {
+        if (typeof params.protocolVersion !== 'string') { rpcError(-32602, 'protocolVersion is required'); return; }
+        const protocolVersion = MCP_SUPPORTED_VERSIONS.slice(1).includes(params.protocolVersion) ? params.protocolVersion : MCP_SUPPORTED_VERSIONS[1];
+        rpcResult({ protocolVersion, capabilities: MCP_CAPABILITIES, serverInfo: MCP_SERVER_INFO });
+        return;
+      }
+      case 'notifications/initialized':
+        sendEmpty(res, 202, {}, reqId);
+        return;
+      case 'ping':
+        rpcResult({});
+        return;
+      case 'tools/list':
+        rpcResult({ tools: MCP_TOOLS });
+        return;
+      case 'tools/call': {
+        const tool = MCP_TOOLS.find((entry) => entry.name === params.name);
+        if (!tool) { rpcError(-32602, 'Unknown tool name'); return; }
+        if (!mcpRecord(params.arguments)) { rpcError(-32602, 'arguments must be an object'); return; }
+        const args = params.arguments;
+        for (const key of tool.inputSchema.required) {
+          if (!Object.hasOwn(args, key)) { rpcError(-32602, `Missing required argument: ${key}`); return; }
+        }
+        for (const [key, schema] of Object.entries(tool.inputSchema.properties)) {
+          if (!Object.hasOwn(args, key)) continue;
+          const value = args[key];
+          const valid = schema.type === 'integer' ? typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+            : typeof value === schema.type && (schema.type !== 'string' || !tool.inputSchema.required.includes(key) || (value as string).trim() !== '');
+          if (!valid) { rpcError(-32602, `Invalid argument: ${key} must be ${schema.type}`); return; }
+        }
+        rpcResult(callMcpTool(tool.name, args, store.users.get('adaiversen')!));
+        return;
+      }
+      default:
+        rpcError(-32601, 'Method not found');
+    }
+  } catch (err) {
+    rpcError(-32603, err instanceof Error ? err.message : 'Internal error');
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Git Smart HTTP Handlers
 
 function handleInfoRefs(
@@ -2421,6 +2673,11 @@ export function createApp(): Server {
       return;
     }
 
+    if (path === '/mcp') {
+      await handleMcp(req, res, reqId);
+      return;
+    }
+
     // Git Smart HTTP routes
     const gitMatch = /^\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
     if (gitMatch) {
@@ -2532,27 +2789,7 @@ export function createApp(): Server {
         sendJson(res, 422, { message: 'Repository already exists' }, {}, reqId);
         return;
       }
-      const newRepo: Repository = {
-        id: store.nextRepoId++,
-        owner: viewer.login,
-        name,
-        description: body.description || '',
-        private: body.private ?? true,
-        default_branch: body.default_branch || 'main',
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        branches: new Map(),
-        refs: new Map(),
-        labels: new Map(),
-        issues: new Map(),
-        issueCounter: 0,
-        pulls: new Map(),
-        pullCounter: 0,
-        comments: new Map(),
-        commentCounter: 0,
-      };
-      store.repos.set(store.repoKey(newRepo.owner, newRepo.name), newRepo);
-      store.userRepoList.push(newRepo);
+      const newRepo = createRepoRecord(viewer, name, body.description || '', body.private ?? true, body.default_branch || 'main');
       sendJson(res, 201, repoJson(newRepo), {}, reqId);
       return;
     }
