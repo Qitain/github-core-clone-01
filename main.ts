@@ -17,6 +17,7 @@
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
 import { createApp } from './app.ts';
+ // Entrypoint lifecycle: bind a port, register with the env, poll until done, then exit 0.
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
